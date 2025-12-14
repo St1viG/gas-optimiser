@@ -1,0 +1,24 @@
+# Validator Configuration
+# ======================
+
+# Number of fuzz test iterations
+fuzz_runs=100000
+
+# Hevm Configuration
+# ------------------
+# Enable/disable hevm symbolic verification (true/false)
+hevm_enabled=true
+
+# Hevm timeout in seconds (overall process timeout)
+hevm_timeout=300
+
+# Hevm solver timeout in milliseconds (Z3 SMT solver per-query timeout)
+hevm_solver_timeout=30000
+
+# Max loop iterations for hevm (prevents infinite loop explosion)
+hevm_max_iterations=5
+
+# Fuzz Test Configuration
+# -----------------------
+# Max array length for fuzz testing
+max_array_length=5
