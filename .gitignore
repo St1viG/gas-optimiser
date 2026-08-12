@@ -1,0 +1,27 @@
+# --- Secrets ---
+.env
+.env.local
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# --- Foundry ---
+foundry/out/
+foundry/cache/
+foundry/broadcast/*/31337/
+foundry/broadcast/**/dry-run/
+docs/book/
+
+# Compiled bytecode dumps produced by the hevm equivalence check
+*.bin
+
+# --- Editor / OS ---
+.DS_Store
+.vscode/
+.idea/
