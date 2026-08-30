@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: ruff check .
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      # forge-std is vendored, so no `forge install` step is needed.
+      - name: Build the Foundry workspace
+        working-directory: foundry
+        run: forge build
+
+      - run: pip install -e ".[dev]"
+
+      # The suite drives the loop with a scripted model; no HF_TOKEN required.
+      - name: Run tests
+        run: pytest -q
+
+  controls:
+    # The fixture pairs are the regression tests that matter most: each one has
+    # a known verdict, and each corresponds to a soundness hole the harness used
+    # to have. Run them through the real CLI, not just pytest.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - run: pip install -e .
+
+      - name: Equivalent and cheaper is accepted
+        run: |
+          python -m gas_optimizer.validator \
+            tests/fixtures/ERC20.sol tests/fixtures/ERC20Candidate.sol
+
+      - name: Unsound unchecked subtraction is rejected
+        run: |
+          if python -m gas_optimizer.validator \
+               tests/fixtures/ERC4626.sol tests/fixtures/ERC4626Candidate.sol; then
+            echo "::error::ERC4626Candidate wraps where the original reverts and was accepted"
+            exit 1
+          fi
+
+      - name: Wrong return value is rejected
+        run: |
+          if python -m gas_optimizer.validator \
+               tests/fixtures/Vault.sol tests/fixtures/VaultBadReturn.sol; then
+            echo "::error::VaultBadReturn returns the wrong value and was accepted"
+            exit 1
+          fi
+
+      - name: Dropped event is rejected
+        run: |
+          if python -m gas_optimizer.validator \
+               tests/fixtures/Emitter.sol tests/fixtures/EmitterCandidate.sol; then
+            echo "::error::EmitterCandidate stops emitting and was accepted"
+            exit 1
+          fi
