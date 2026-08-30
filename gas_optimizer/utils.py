@@ -1,140 +1,97 @@
 """
-Utility functions for the Solidity optimizer.
+Source-level helpers for handling model output.
+
+The model returns a complete contract rather than a diff. That removes an
+entire failure class: a hand-rolled fuzzy patcher has to guess which of several
+identical lines a hunk meant, and silently produces a no-op when it guesses
+wrong. A whole file either parses and compiles or it does not.
+
+The authoritative shape check (same public ABI) happens after compilation in
+verification.harness_generator. What lives here are the cheap checks worth
+making before spending a compile on obviously unusable output.
 """
+
+from __future__ import annotations
+
 import re
 
+_FENCE = re.compile(r"```(?:solidity|sol)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
+_CONTRACT = re.compile(r"\bcontract\s+(\w+)")
+_PRAGMA = re.compile(r"^\s*pragma\s+solidity\s+([^;]+);", re.MULTILINE)
+
+
 def clean_llm_response(response_text: str) -> str:
-    """Removes markdown code block markers."""
-    pattern = r"```(?:diff)?\s*(.*?)\s*```"
-    match = re.search(pattern, response_text, re.DOTALL)
-    if match:
-        return match.group(1).strip()
+    """Strip markdown fencing and surrounding prose from a model response.
+
+    Picks the longest fenced block when several are present — models sometimes
+    quote a snippet before emitting the full contract.
+    """
+    if not response_text:
+        return ""
+
+    blocks = _FENCE.findall(response_text)
+    if blocks:
+        return max(blocks, key=len).strip()
     return response_text.strip()
 
-def strip_inline_comments(line: str) -> str:
-    """
-    Removes inline comments added by LLM from a code line.
-    """
-    llm_comment_patterns = [
-        r'\s*//\s*Ensure.*$',
-        r'\s*//\s*This.*$',
-        r'\s*//\s*Safe because.*$',
-        r'\s*//\s*No overflow.*$',
-        r'\s*//\s*Cannot overflow.*$',
-        r'\s*//\s*Overflow.*$',
-        r'\s*//\s*Gas optimization.*$',
-        r'\s*//\s*Optimized.*$',
-        r'(\s*//[^/].*){2,}',
-    ]
-    
-    result = line
-    for pattern in llm_comment_patterns:
-        result = re.sub(pattern, '', result, flags=re.IGNORECASE)
-    
-    return result
 
-def normalize_string(s: str) -> str:
-    """Removes all whitespace to allow fuzzy matching."""
-    return "".join(s.split())
+def extract_contract_name(code: str) -> str | None:
+    """Name of the first contract declared in `code`, or None."""
+    match = _CONTRACT.search(code)
+    return match.group(1) if match else None
 
-def extract_contract_name(code: str) -> str:
-    """Extracts the contract name from Solidity source code."""
-    match = re.search(r'contract\s+(\w+)', code)
-    if match:
-        return match.group(1)
-    return "UnknownContract"
+
+def extract_pragma(code: str) -> str | None:
+    """The solidity version pragma, normalized for whitespace."""
+    match = _PRAGMA.search(code)
+    return " ".join(match.group(1).split()) if match else None
+
 
 def rename_contract(code: str, old_name: str, new_name: str) -> str:
-    """Renames a contract declaration, e.g. `contract X` -> `contract XCandidate`.
+    """Rename a contract declaration, e.g. `contract X` -> `contract XCandidate`.
 
-    The candidate must not share a contract name with the original: the validator
-    derives Foundry filenames from the declared name, so identical names make the
-    candidate overwrite the original.
+    The candidate must not share a contract name with the original: filenames
+    are derived from the declared name, so identical names make the candidate
+    overwrite the original and get compared against itself.
     """
-    return re.sub(rf'\bcontract\s+{re.escape(old_name)}\b',
-                  f'contract {new_name}', code)
+    return re.sub(rf"\bcontract\s+{re.escape(old_name)}\b", f"contract {new_name}", code)
 
-def apply_patch(original_code: str, diff_text: str) -> tuple[str | None, str | None]:
+
+def check_candidate_source(original_code: str, candidate_code: str) -> list[str]:
+    """Cheap pre-compile checks on model output. Empty list means usable.
+
+    Deliberately shallow — anything requiring real Solidity semantics is left
+    to the compiler and to the ABI parity check in the harness generator.
     """
-    Applies a unified diff fuzzily. 
-    """
-    clean_diff = clean_llm_response(diff_text)
-    lines = clean_diff.splitlines()
-    
-    hunks = []
-    current_hunk = {"remove": [], "add": []}
-    in_hunk = False
+    problems: list[str] = []
 
-    for line in lines:
-        if line.startswith("---") or line.startswith("+++") or line.startswith("diff") or line.startswith("index"):
-            continue
+    if not candidate_code.strip():
+        return ["the response was empty"]
 
-        if line.startswith("@@"):
-            if in_hunk and (current_hunk["remove"] or current_hunk["add"]):
-                hunks.append(current_hunk)
-                current_hunk = {"remove": [], "add": []}
-            in_hunk = True
-            continue
-            
-        if not in_hunk and (line.startswith("-") or line.startswith("+")):
-            in_hunk = True
+    if "```" in candidate_code:
+        problems.append("the response still contains markdown fencing")
 
-        if line.startswith("-"):
-            current_hunk["remove"].append(line[1:])
-        elif line.startswith("+"):
-            clean_line = strip_inline_comments(line[1:])
-            current_hunk["add"].append(clean_line)
-    
-    if current_hunk["remove"] or current_hunk["add"]:
-        hunks.append(current_hunk)
+    original_name = extract_contract_name(original_code)
+    candidate_name = extract_contract_name(candidate_code)
+    if candidate_name is None:
+        problems.append("no `contract` declaration found in the response")
+    elif original_name and candidate_name != original_name:
+        problems.append(
+            f"the contract was renamed from `{original_name}` to `{candidate_name}`; "
+            f"keep the original name"
+        )
 
-    if not hunks:
-        return None, "No valid hunks found in diff"
+    original_pragma = extract_pragma(original_code)
+    candidate_pragma = extract_pragma(candidate_code)
+    if candidate_pragma is None:
+        problems.append("the response has no `pragma solidity` line")
+    elif original_pragma and candidate_pragma != original_pragma:
+        problems.append(
+            f"the pragma changed from `{original_pragma}` to `{candidate_pragma}`; "
+            f"keep the compiler version unchanged"
+        )
 
-    modified_code = original_code
+    if candidate_code.strip() == original_code.strip():
+        problems.append("the response is identical to the input; no optimization was applied")
 
-    for i, hunk in enumerate(hunks):
-        search_lines = hunk["remove"]
-        replace_lines = hunk["add"]
-
-        if not search_lines:
-            continue 
-
-        # 1. Exact match
-        search_block = "\n".join(search_lines)
-        if search_block in modified_code:
-            replace_block = "\n".join(replace_lines)
-            modified_code = modified_code.replace(search_block, replace_block, 1)
-            continue
-
-        # 2. Fuzzy match
-        original_lines = modified_code.splitlines()
-        best_match_index = -1
-        
-        norm_search = [normalize_string(l) for l in search_lines if l.strip()]
-        if not norm_search:
-            continue
-
-        for line_idx in range(len(original_lines)):
-            match = True
-            for offset, s_line in enumerate(norm_search):
-                if line_idx + offset >= len(original_lines):
-                    match = False
-                    break
-                if normalize_string(original_lines[line_idx + offset]) != s_line:
-                    match = False
-                    break
-            
-            if match:
-                best_match_index = line_idx
-                break
-        
-        if best_match_index != -1:
-            before = original_lines[:best_match_index]
-            after = original_lines[best_match_index + len(search_lines):]
-            new_code_lines = before + replace_lines + after
-            modified_code = "\n".join(new_code_lines)
-        else:
-            return None, f"Could not find code block for hunk #{i+1}."
-
-    return modified_code, None
+    return problems

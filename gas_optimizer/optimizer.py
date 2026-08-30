@@ -1,85 +1,126 @@
-from . import config
-from . import llm_client
-from . import utils
-from . import validator
+"""
+The generate-and-verify loop.
 
+Each attempt asks for a complete optimized contract, writes it beside the
+original under a distinct name, and puts it through the validator. Anything the
+validator rejects comes back as structured feedback for the next attempt.
+
+Note the loop carries `current_code` forward across attempts. The previous
+version reset to the pristine original every time while telling the model it was
+looking at "code after last patch", so successive optimizations could never
+accumulate and the retry prompt described a state that did not exist.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from . import config, llm_client, utils, validator
+
+
+@dataclass
 class OptimizationResult:
-    def __init__(self, success: bool, message: str, optimized_code: str | None = None):
-        self.success = success
-        self.message = message
-        self.optimized_code = optimized_code
+    success: bool
+    message: str
+    optimized_code: str | None = None
+    attempts: int = 0
+    gas: list[validator.GasEntry] = field(default_factory=list)
+    candidate_path: Path | None = None
 
-def run_optimization_loop(original_code: str) -> OptimizationResult:
-    """
-    Main Loop:
-    1. Determine contract name.
-    2. Save original as {Name}.sol.
-    3. LLM loop -> Save candidate as {Name}Candidate.sol.
-    4. Validate using specific paths.
-    """
-    current_code = original_code
-    retry_info = None
-    
-    # 1. Odredi ime ugovora
+    @property
+    def total_delta(self) -> int:
+        return sum(e.delta for e in self.gas if e.comparable)
+
+
+def _shape_failure(problems: list[str]) -> dict:
+    return {
+        "compile": "false",
+        "test": "N/A",
+        "type": "shape_error",
+        "error": "; ".join(problems),
+        "trace": "The response must be the complete contract, same name, same pragma.",
+    }
+
+
+def run_optimization_loop(original_code: str, verbose: bool = True) -> OptimizationResult:
+    """Optimize `original_code`, verifying every proposal before accepting it."""
     contract_name = utils.extract_contract_name(original_code)
-    print(f"[INFO] Detected Contract Name: {contract_name}")
-    
-    # 2. Definisi putanje
+    if not contract_name:
+        return OptimizationResult(False, "No `contract` declaration found in the input.")
+
+    candidate_name = f"{contract_name}Candidate"
+
     config.SOL_FOLDER.mkdir(parents=True, exist_ok=True)
-
     original_path = config.SOL_FOLDER / f"{contract_name}.sol"
-    candidate_path = config.SOL_FOLDER / f"{contract_name}Candidate.sol"
-
-    # 3. Sacuvaj original
+    candidate_path = config.SOL_FOLDER / f"{candidate_name}.sol"
     original_path.write_text(original_code, encoding="utf-8")
-    print(f"[INFO] Saved original to: {original_path}")
+
+    print(f"[INFO] Contract: {contract_name}")
+
+    settings = validator.load_config()
+    current_code = original_code
+    retry_info: dict | None = None
+    last_message = "no attempts were made"
 
     for attempt in range(1, config.MAX_RETRIES + 1):
-        print(f"\n" + "="*50)
-        print(f"ATTEMPT {attempt}/{config.MAX_RETRIES}")
-        print("="*50)
-        
-        print(f"[1] Calling LLM (Context: {'Retry' if retry_info else 'Fresh'})...")
-        diff = llm_client.get_optimization_proposal(current_code, retry_info)
-        
-        if not diff:
-            print("[ERROR] LLM returned empty response.")
-            return OptimizationResult(False, "LLM returned no response")
-        
-        print("[2] Applying patch...")
-        candidate_code, patch_error = utils.apply_patch(original_code, diff)
-        
-        if patch_error:
-            print(f"[2] PATCH FAILED: {patch_error}")
-            retry_info = {
-                "compile": "false", 
-                "test": "N/A", 
-                "type": "patch_apply_error",
-                "error": f"Could not apply patch: {patch_error}", 
-                "trace": "Diff was invalid or context mismatch."
-            }
-            continue 
-        
-        # 4. Sacuvaj kandidata pod svojim imenom ugovora, da ne pregazi original
-        candidate_code = utils.rename_contract(
-            candidate_code, contract_name, f"{contract_name}Candidate"
+        header = f"ATTEMPT {attempt}/{config.MAX_RETRIES}"
+        if retry_info:
+            header += f"  (fixing {retry_info['type']})"
+        print("\n" + "=" * 60)
+        print(header)
+        print("=" * 60)
+
+        print("[1] Requesting a candidate...")
+        try:
+            candidate_code = llm_client.get_optimization_proposal(current_code, retry_info)
+        except llm_client.LLMError as exc:
+            return OptimizationResult(False, str(exc), attempts=attempt)
+
+        problems = utils.check_candidate_source(current_code, candidate_code)
+        if problems:
+            print(f"[2] Rejected before compiling: {'; '.join(problems)}")
+            retry_info = _shape_failure(problems)
+            retry_info["attempt"] = attempt
+            last_message = retry_info["error"]
+            continue
+
+        # The candidate must not declare the same contract as the original, or
+        # it overwrites it and ends up compared against itself.
+        candidate_path.write_text(
+            utils.rename_contract(candidate_code, contract_name, candidate_name),
+            encoding="utf-8",
         )
-        candidate_path.write_text(candidate_code, encoding="utf-8")
 
+        print("[2] Validating...")
+        result = validator.validate(original_path, candidate_path, settings, verbose=verbose)
 
-        print(f"[3] Validating candidate at: {candidate_path}...")
-        # Pozivamo validator sa dinamičkim putanjama
-        is_valid, failure_data = validator.validate(original_path, candidate_path)
-        
-        if is_valid:
-            print(f"\n[SUCCESS] Optimization verified at attempt {attempt}!")
-            return OptimizationResult(True, "Optimization successful!", candidate_code)
-        
-        print(f"[4] VALIDATION FAILED.")
-        print(f"    Type: {failure_data.get('type')}")
-        print(f"    Error: {failure_data.get('error')}")
-        
-        retry_info = failure_data
-        retry_info['attempt'] = attempt
-    
-    return OptimizationResult(False, f"Max retries ({config.MAX_RETRIES}) reached without success.")
+        if result.ok:
+            print(f"\n[SUCCESS] Verified on attempt {attempt}.")
+            return OptimizationResult(
+                True,
+                f"Equivalent and {abs(result.total_delta)} gas cheaper.",
+                optimized_code=candidate_code,
+                attempts=attempt,
+                gas=result.gas,
+                candidate_path=candidate_path,
+            )
+
+        failure = result.failure or {}
+        print(f"[3] Rejected [{failure.get('type')}]: {failure.get('error')}")
+
+        retry_info = dict(failure)
+        retry_info["attempt"] = attempt
+        last_message = f"{failure.get('type')}: {failure.get('error')}"
+
+        # Feed the rejected candidate forward: the model is asked to fix that
+        # specific failure, not to start over. A candidate that failed to
+        # compile is not a useful base, so fall back to the last good source.
+        if failure.get("compile") == "true":
+            current_code = candidate_code
+
+    return OptimizationResult(
+        False,
+        f"No candidate passed in {config.MAX_RETRIES} attempts. Last failure: {last_message}",
+        attempts=config.MAX_RETRIES,
+    )
