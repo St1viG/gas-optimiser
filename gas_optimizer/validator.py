@@ -37,7 +37,8 @@ DEFAULT_SETTINGS: dict[str, object] = {
     "fuzz_runs": 2000,
     "hevm_enabled": False,
     "hevm_timeout": 300,
-    "hevm_solver_timeout": 30000,
+    "hevm_smt_timeout": 30,
+    "hevm_solver": "z3",
     "hevm_max_iterations": 5,
     "max_array_length": 5,
     "require_gas_improvement": True,
@@ -45,6 +46,7 @@ DEFAULT_SETTINGS: dict[str, object] = {
 }
 
 BOOL_KEYS = {"hevm_enabled", "require_gas_improvement"}
+STR_KEYS = {"hevm_solver"}
 _TRUTHY = ("true", "1", "yes", "on")
 
 GAS_LOG_PREFIX = "GASRESULT|"
@@ -71,6 +73,8 @@ def load_config(config_path: Path | str = config.VALIDATOR_CONFIG_PATH) -> dict:
             continue
         if key in BOOL_KEYS:
             settings[key] = value.lower() in _TRUTHY
+        elif key in STR_KEYS:
+            settings[key] = value
         else:
             try:
                 settings[key] = int(value)
@@ -398,6 +402,60 @@ def _run_gas_bench(settings: dict) -> tuple[list[GasEntry], dict | None]:
 # --- hevm (advisory) ---------------------------------------------------------
 
 
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+# hevm 0.58 wording. Order matters when matching: "do not behave equivalently"
+# contains "behave equivalently" as a substring, so failure is checked first.
+_HEVM_FAIL = ("do not behave equivalently", "not equivalent")
+_HEVM_PASS = ("behave equivalently", "no discrepancies found")
+
+
+def parse_hevm_output(stdout: str) -> tuple[bool | None, list[str]]:
+    """Read hevm's verdict from its output.
+
+    Returns (True, []) for equivalent, (False, counterexamples) for a proven
+    divergence, and (None, []) when hevm said neither — a crash, a rejected
+    flag, or a solver timeout. Only an explicit failure may reject a candidate;
+    matching on exit status alone silently turned "hevm could not run" into
+    "inconclusive", and a fuzzy line match missed the real verdict entirely.
+    """
+    text = _ANSI.sub("", stdout or "")
+    lowered = text.lower()
+
+    if any(marker in lowered for marker in _HEVM_FAIL):
+        return False, _hevm_counterexamples(text)
+    if any(marker in lowered for marker in _HEVM_PASS):
+        return True, []
+    return None, []
+
+
+def _hevm_counterexamples(text: str, limit: int = 3) -> list[str]:
+    """Pull the concrete divergence witnesses out of a failure report."""
+    start = text.find("Not equivalent")
+    block = text[start:] if start != -1 else text
+
+    chunks = [chunk.strip() for chunk in block.split("-----") if chunk.strip()]
+    witnesses = [c for c in chunks if "Calldata:" in c] or chunks[1:] or chunks
+    return [c[:800] for c in witnesses[:limit]] or ["hevm reported a divergence"]
+
+
+def hevm_summary(counterexample: str) -> str:
+    """One-line description of a divergence, for the retry prompt."""
+    difference = calldata = ""
+    lines = counterexample.splitlines()
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("Difference:"):
+            difference = stripped
+        elif stripped == "Calldata:" and i + 1 < len(lines):
+            calldata = lines[i + 1].strip()
+
+    parts = [difference or "hevm found divergent behaviour"]
+    if calldata:
+        parts.append(f"calldata={calldata[:74]}")
+    return " | ".join(parts)
+
+
 def _kill_process_tree(pid: int) -> None:
     try:
         os.killpg(os.getpgid(pid), signal.SIGKILL)
@@ -421,9 +479,14 @@ def _run_hevm(
         "hevm", "equivalence",
         "--code-a-file", str(original_bin),
         "--code-b-file", str(candidate_bin),
-        "--smttimeout", str(settings["hevm_solver_timeout"]),
+        # Spelled --smt-timeout, in SECONDS. The old --smttimeout with a
+        # millisecond value was rejected outright, so hevm never ran.
+        "--smt-timeout", str(settings["hevm_smt_timeout"]),
         "--max-iterations", str(settings["hevm_max_iterations"]),
     ]
+    solver = str(settings.get("hevm_solver", "")).strip()
+    if solver:
+        cmd += ["--solver", solver]
 
     process = None
     try:
@@ -436,17 +499,14 @@ def _run_hevm(
         )
         stdout, _ = process.communicate(timeout=settings["hevm_timeout"])
 
-        if process.returncode == 0:
+        verdict, counterexamples = parse_hevm_output(stdout)
+        if verdict is True:
             return True, [], ""
-
-        counterexamples = [
-            line.strip()
-            for line in stdout.splitlines()
-            if "not equal" in line.lower() or "counterexample" in line.lower()
-        ]
-        if counterexamples:
+        if verdict is False:
             return False, counterexamples, ""
-        return False, [], "hevm exited non-zero without a counterexample"
+        return False, [], (
+            f"hevm gave no verdict (exit {process.returncode}): {stdout.strip()[:200]}"
+        )
 
     except subprocess.TimeoutExpired:
         if process:
@@ -502,9 +562,9 @@ def _hevm_gate(
 
     return _failure(
         "symbolic_counterexample",
-        counterexamples[0],
+        hevm_summary(counterexamples[0]),
         test="hevm",
-        trace="\n".join(counterexamples[:3]),
+        trace="\n\n".join(counterexamples[:3]),
     ), notes
 
 

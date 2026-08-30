@@ -1,0 +1,3 @@
+   [PASS] Contracts behave equivalently
+
+No discrepancies found

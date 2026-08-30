@@ -1,0 +1,3 @@
+Invalid option `--smttimeout'
+
+Usage: hevm COMMAND

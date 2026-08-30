@@ -14,8 +14,11 @@ hevm_enabled=false
 # Hevm timeout in seconds (overall process timeout)
 hevm_timeout=300
 
-# Hevm solver timeout in milliseconds (Z3 SMT solver per-query timeout)
-hevm_solver_timeout=30000
+# SMT solver: z3, bitwuzla or cvc5. The binary must be on PATH.
+hevm_solver=z3
+
+# Per-query SMT solver timeout, in SECONDS (hevm's --smt-timeout)
+hevm_smt_timeout=30
 
 # Max loop iterations for hevm (prevents infinite loop explosion)
 hevm_max_iterations=5
