@@ -1,9 +1,11 @@
 """
-Configuration and path constants for the Solidity gas optimizer.
+Configuration and path constants.
 
 Every path is derived from the package location, so the pipeline behaves the
 same regardless of the working directory it is launched from.
 """
+
+from __future__ import annotations
 
 import os
 from pathlib import Path
@@ -16,25 +18,20 @@ PROJECT_ROOT = PACKAGE_DIR.parent
 # Foundry workspace. `forge` is always invoked with this as its cwd.
 FOUNDRY_DIR = PROJECT_ROOT / "foundry"
 
-# Foundry's own source/test dirs, per foundry/foundry.toml.
-# Generated originals and candidates are written into SOL_FOLDER.
+# Scratch space owned by the validator: originals, candidates and the generated
+# harness are all rewritten on every run. Nothing here is source.
 SOL_FOLDER = FOUNDRY_DIR / "src"
 TEST_FOLDER = FOUNDRY_DIR / "test"
 
-# Auto-generated equivalence test, rewritten on every validation run.
-EQUIVALENCE_TEST_PATH = TEST_FOLDER / "EquivalenceTest.t.sol"
-
-# Verification tooling
-FUZZ_GENERATOR_PATH = PACKAGE_DIR / "verification" / "fuzz_test_generator.py"
-
-# Validator tunables (fuzz runs, hevm toggles) — see validatorConfig.txt
+# Validator tunables (fuzz runs, gas gate, hevm toggles).
 VALIDATOR_CONFIG_PATH = PROJECT_ROOT / "validatorConfig.txt"
 
-# Test-case inputs
+# Test-case inputs.
 TEST_CASES_DIR = PROJECT_ROOT / "test-cases"
 
 
-# --- Secrets / model ---------------------------------------------------------
+# --- Environment -------------------------------------------------------------
+
 
 def _load_dotenv() -> None:
     """Load PROJECT_ROOT/.env if python-dotenv is available.
@@ -50,14 +47,37 @@ def _load_dotenv() -> None:
 
 _load_dotenv()
 
+
+def _int_env(name: str, default: int) -> int:
+    """Read an integer setting, falling back rather than crashing on junk."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"[WARN] {name}={raw!r} is not an integer; using {default}")
+        return default
+
+
 MODEL_ID = os.environ.get("MODEL_ID", "Qwen/Qwen2.5-Coder-32B-Instruct")
+
+# Recent huggingface_hub routes inference through named providers. Left empty
+# the client picks its own default, which is what most setups want.
+HF_PROVIDER = os.environ.get("HF_PROVIDER", "").strip()
+
+# Attempts at the optimize-and-verify loop.
+MAX_RETRIES = _int_env("MAX_RETRIES", 5)
+
+# Attempts at a single API call before giving up on it.
+API_RETRIES = _int_env("API_RETRIES", 3)
 
 
 def get_hf_token() -> str:
     """Return the Hugging Face token, or raise with a fixable message.
 
-    Read lazily so that importing this module never fails — only the code paths
-    that actually call the API require a token.
+    Read lazily so importing this module never fails — only the code paths that
+    actually call the API require a token.
     """
     token = os.environ.get("HF_TOKEN", "").strip()
     if not token:
@@ -68,8 +88,3 @@ def get_hf_token() -> str:
             "  Tokens: https://huggingface.co/settings/tokens"
         )
     return token
-
-
-# --- Retry settings ----------------------------------------------------------
-
-MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "5"))
