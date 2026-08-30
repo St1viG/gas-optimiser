@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gas-optimizer"
+version = "0.1.0"
+description = "AI-powered Solidity gas optimizer with a generate-and-verify loop"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "GPL-3.0" }
+
+dependencies = [
+    "huggingface_hub>=0.27,<1.0",
+    "python-dotenv>=1.0,<2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+gas-optimize = "gas_optimizer.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["gas_optimizer*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "foundry: requires the `forge` binary and compiles Solidity (slow)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+# Vendored third-party tooling; not ours to style.
+exclude = ["foundry/lib"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# Prompt text is content, not code — rewrapping it changes what the model reads.
+"gas_optimizer/prompts.py" = ["E501"]
