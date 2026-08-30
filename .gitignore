@@ -14,6 +14,14 @@ venv/
 # --- Foundry ---
 foundry/out/
 foundry/cache/
+foundry/snapshots/
+# src/ and test/ are scratch: originals, candidates and the equivalence
+# harness are all regenerated on every run. Inputs live in test-cases/,
+# fixtures in tests/fixtures/.
+foundry/src/*
+!foundry/src/.gitkeep
+foundry/test/*
+!foundry/test/.gitkeep
 foundry/broadcast/*/31337/
 foundry/broadcast/**/dry-run/
 docs/book/
