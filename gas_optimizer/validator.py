@@ -1,203 +1,404 @@
 """
-Validator for Solidity code optimization.
+Decides whether an optimized candidate may be accepted.
 
-Compares original and candidate code to verify semantic equivalence using fuzz
-testing (Foundry) and optional symbolic execution (hevm).
+A candidate has to clear two independent gates:
 
-All `forge` invocations run with cwd=config.FOUNDRY_DIR, so this module works
-regardless of where the process was started from.
+  1. Equivalence — differential fuzzing over a generated harness. Original and
+     candidate receive identical calldata from identical state; revert status,
+     return data, storage writes and emitted events must match.
+  2. Gas — a deterministic benchmark. The candidate may not regress on any
+     function, and must be strictly cheaper on at least one. Without this an
+     unchanged (or slower) candidate would pass, which is what "optimized"
+     used to mean here.
+
+Optionally a third, `hevm equivalence`, when the binary is installed. It is
+advisory: a missing binary or a solver timeout is reported as skipped, never as
+a counterexample.
+
+All `forge` invocations run with cwd=config.FOUNDRY_DIR, so this module behaves
+the same regardless of where the process was started.
 """
 
+from __future__ import annotations
+
+import json
 import os
 import re
 import signal
 import subprocess
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple
 
 from . import config
+from .verification import artifacts, harness_generator
 
-DEFAULT_SETTINGS = {
-    "fuzz_runs": 1000,
-    "hevm_enabled": False,  # Default to False for faster iteration
+DEFAULT_SETTINGS: dict[str, object] = {
+    "fuzz_runs": 2000,
+    "hevm_enabled": False,
     "hevm_timeout": 300,
     "hevm_solver_timeout": 30000,
     "hevm_max_iterations": 5,
     "max_array_length": 5,
+    "require_gas_improvement": True,
+    "forge_timeout": 900,
 }
+
+BOOL_KEYS = {"hevm_enabled", "require_gas_improvement"}
+_TRUTHY = ("true", "1", "yes", "on")
+
+GAS_LOG_PREFIX = "GASRESULT|"
+
+
+# --- configuration -----------------------------------------------------------
 
 
 def load_config(config_path: Path | str = config.VALIDATOR_CONFIG_PATH) -> dict:
-    """Load validator settings from validatorConfig.txt."""
+    """Load validator settings, falling back to DEFAULT_SETTINGS."""
     settings = dict(DEFAULT_SETTINGS)
 
-    if not os.path.exists(config_path):
+    path = Path(config_path)
+    if not path.exists():
         return settings
 
-    with open(config_path, "r") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
 
-            key, value = line.split("=", 1)
-            key, value = key.strip(), value.strip()
-
-            if key not in settings:
-                continue
-            if key == "hevm_enabled":
-                settings[key] = value.lower() in ("true", "1", "yes", "on")
-            else:
-                try:
-                    settings[key] = int(value)
-                except ValueError:
-                    settings[key] = value
+        key, value = (part.strip() for part in line.split("=", 1))
+        if key not in settings:
+            continue
+        if key in BOOL_KEYS:
+            settings[key] = value.lower() in _TRUTHY
+        else:
+            try:
+                settings[key] = int(value)
+            except ValueError:
+                settings[key] = value
 
     return settings
 
 
+def _render(value: object) -> str:
+    return ("true" if value else "false") if isinstance(value, bool) else str(value)
+
+
 def save_config(settings: dict, config_path: Path | str = config.VALIDATOR_CONFIG_PATH) -> None:
-    """Write settings back to validatorConfig.txt, preserving comments."""
-    lines = []
-    if os.path.exists(config_path):
-        with open(config_path, "r") as f:
-            for line in f:
-                stripped = line.strip()
-                if "=" in stripped and not stripped.startswith("#"):
-                    key = stripped.split("=", 1)[0].strip()
-                    if key in settings:
-                        value = settings[key]
-                        if isinstance(value, bool):
-                            value = "true" if value else "false"
-                        lines.append(f"{key}={value}")
-                        continue
-                lines.append(line.rstrip("\n"))
-    else:
-        lines = ["# Validator Configuration"]
-        for key, value in settings.items():
-            if isinstance(value, bool):
-                value = "true" if value else "false"
-            lines.append(f"{key}={value}")
+    """Write settings back, preserving comments and ordering."""
+    path = Path(config_path)
 
-    with open(config_path, "w") as f:
-        f.write("\n".join(lines) + "\n")
+    if not path.exists():
+        body = ["# Validator Configuration"]
+        body += [f"{k}={_render(v)}" for k, v in settings.items()]
+        path.write_text("\n".join(body) + "\n")
+        return
+
+    out = []
+    for line in path.read_text().splitlines():
+        stripped = line.strip()
+        if "=" in stripped and not stripped.startswith("#"):
+            key = stripped.split("=", 1)[0].strip()
+            if key in settings:
+                out.append(f"{key}={_render(settings[key])}")
+                continue
+        out.append(line)
+
+    path.write_text("\n".join(out) + "\n")
 
 
-def run_command(command_list: List[str], cwd: Path | str | None = None) -> Tuple[int, str, str]:
-    """Run a command and return (returncode, stdout, stderr)."""
+# --- results -----------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class GasEntry:
+    signature: str
+    original: int
+    candidate: int
+    original_ok: bool
+    candidate_ok: bool
+
+    @property
+    def comparable(self) -> bool:
+        """Only calls that succeeded on both sides carry a meaningful number."""
+        return self.original_ok and self.candidate_ok
+
+    @property
+    def delta(self) -> int:
+        return self.candidate - self.original
+
+    @property
+    def improved(self) -> bool:
+        return self.comparable and self.candidate < self.original
+
+    @property
+    def regressed(self) -> bool:
+        return self.comparable and self.candidate > self.original
+
+    def describe(self) -> str:
+        if not self.comparable:
+            return f"{self.signature}: reverted, not measured"
+        sign = "+" if self.delta > 0 else ""
+        return (
+            f"{self.signature}: {self.original} -> {self.candidate} gas "
+            f"({sign}{self.delta})"
+        )
+
+
+@dataclass
+class ValidationResult:
+    ok: bool
+    failure: dict | None = None
+    gas: list[GasEntry] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def total_delta(self) -> int:
+        return sum(e.delta for e in self.gas if e.comparable)
+
+    def gas_summary(self) -> str:
+        if not self.gas:
+            return "no gas measurements"
+        lines = [f"  {e.describe()}" for e in self.gas]
+        lines.append(f"  total: {self.total_delta:+d} gas")
+        return "\n".join(lines)
+
+
+def _failure(
+    failure_type: str,
+    error: str,
+    *,
+    compile_ok: bool = True,
+    test: str = "N/A",
+    trace: str = "",
+) -> dict:
+    """Failure payload in the shape prompts.USER_PROMPT_RETRY expects."""
+    return {
+        "compile": "true" if compile_ok else "false",
+        "test": test,
+        "type": failure_type,
+        "error": error,
+        "trace": trace,
+    }
+
+
+# --- process helpers ---------------------------------------------------------
+
+
+def run_command(
+    command: list[str],
+    cwd: Path | str | None = None,
+    timeout: float | None = None,
+) -> tuple[int, str, str]:
+    """Run a command and return (returncode, stdout, stderr).
+
+    A timeout is reported as a normal non-zero result so callers never hang.
+    """
     try:
         result = subprocess.run(
-            command_list,
+            command,
             capture_output=True,
             text=True,
             cwd=str(cwd) if cwd else None,
+            timeout=timeout,
         )
         return result.returncode, result.stdout or "", result.stderr or ""
-    except Exception as e:
-        return 1, "", str(e)
+    except subprocess.TimeoutExpired:
+        return 124, "", f"timed out after {timeout}s: {' '.join(command)}"
+    except FileNotFoundError:
+        return 127, "", f"command not found: {command[0]}"
+    except OSError as exc:
+        return 1, "", str(exc)
 
 
-def run_forge(args: List[str]) -> Tuple[int, str, str]:
+def run_forge(args: list[str], timeout: float | None = None) -> tuple[int, str, str]:
     """Run a forge subcommand inside the Foundry workspace."""
-    return run_command(["forge", *args], cwd=config.FOUNDRY_DIR)
+    return run_command(["forge", *args], cwd=config.FOUNDRY_DIR, timeout=timeout)
 
 
-def extract_contract_name(filepath: Path | str) -> Optional[str]:
-    """Extract the contract name from a Solidity file."""
-    try:
-        with open(filepath, "r") as f:
-            match = re.search(r"contract\s+(\w+)", f.read())
-        return match.group(1) if match else None
-    except OSError:
-        return None
+def _forge_test_json(args: list[str], timeout: float | None) -> tuple[dict, str]:
+    """Run `forge test --json -vv` and return (parsed suites, raw output).
 
-
-def generate_fuzz_test(original_path: Path, candidate_path: Path,
-                       original_contract: str, candidate_contract: str,
-                       output_path: Path, settings: dict) -> Tuple[bool, str]:
+    Returns an empty dict if the run produced no JSON (a compile failure, say),
+    leaving the raw text for the caller to report.
     """
-    Generate the Foundry fuzz test comparing the two contracts.
-    Returns: (success, error_message)
+    _, stdout, stderr = run_forge([*args, "--json", "-vv"], timeout=timeout)
+    raw = (stdout + "\n" + stderr).strip()
+
+    for line in stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                return json.loads(line), raw
+            except json.JSONDecodeError:
+                continue
+
+    return {}, raw
+
+
+def _iter_tests(suites: dict):
+    for suite_name, suite in suites.items():
+        for test_name, result in (suite.get("test_results") or {}).items():
+            yield suite_name, test_name, result
+
+
+# --- workspace ---------------------------------------------------------------
+
+
+def prepare_workspace(original: Path, candidate: Path) -> tuple[Path, Path]:
+    """Copy the pair into foundry/src and clear stale generated files.
+
+    The test dir must be emptied *before* the first build: a harness left over
+    from a previous run still imports contracts that no longer exist, and the
+    build fails for reasons that have nothing to do with the candidate.
     """
-    generator_path = config.FUZZ_GENERATOR_PATH
-    if not generator_path.exists():
-        return False, f"fuzz_test_generator.py not found at {generator_path}"
+    config.SOL_FOLDER.mkdir(parents=True, exist_ok=True)
+    config.TEST_FOLDER.mkdir(parents=True, exist_ok=True)
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    # Read before clearing: the caller may already have written the pair into
+    # src/, in which case wiping first would delete the very files we copy.
+    original_source = original.read_text(encoding="utf-8")
+    candidate_source = candidate.read_text(encoding="utf-8")
 
-    cmd = [
-        sys.executable, str(generator_path),
-        str(original_path),
-        str(candidate_path),
-        "-o", str(output_path),
-        "--original-contract", original_contract,
-        "--candidate-contract", candidate_contract,
-        "--max-array-length", str(settings.get("max_array_length", 5)),
-    ]
+    for stale in (*config.SOL_FOLDER.glob("*.sol"), *config.TEST_FOLDER.glob("*.sol")):
+        stale.unlink()
 
-    returncode, stdout, stderr = run_command(cmd)
-    if returncode != 0:
-        return False, f"Generator failed: {stderr}\n{stdout}"
-
-    return True, ""
+    src_original = config.SOL_FOLDER / original.name
+    src_candidate = config.SOL_FOLDER / candidate.name
+    src_original.write_text(original_source, encoding="utf-8")
+    src_candidate.write_text(candidate_source, encoding="utf-8")
+    return src_original, src_candidate
 
 
-def run_fuzz_tests(fuzz_runs: int) -> Tuple[bool, List[str]]:
-    """
-    Run the equivalence fuzz tests with Foundry.
-    Returns: (success, counterexamples/errors)
-    """
-    returncode, stdout, stderr = run_forge([
-        "test",
-        "--match-contract", "EquivalenceTest",
-        "--fuzz-runs", str(fuzz_runs),
-        "-vvv",
-    ])
-
-    if returncode == 0:
-        return True, []
-
-    return False, parse_fuzz_failures(stdout + stderr)
+def _contract_name(source: Path) -> str | None:
+    match = re.search(r"\bcontract\s+(\w+)", source.read_text(encoding="utf-8"))
+    return match.group(1) if match else None
 
 
-def parse_fuzz_failures(output: str) -> List[str]:
-    """Parse failure information from Foundry output."""
-    errors = []
-
-    for match in re.findall(r"counterexample:.*?args=\[([^\]]+)\]", output,
-                            re.IGNORECASE | re.DOTALL)[:5]:
-        errors.append(f"Counterexample: args=[{match}]")
-
-    for match in re.findall(r"\[FAIL[^\]]*\].*?(?=\n\n|\[FAIL|\Z)", output, re.DOTALL):
-        if len(errors) >= 5:
-            break
-        if match.strip():
-            errors.append(match.strip()[:300])
-
-    if "Compiler run failed" in output:
-        for match in re.findall(r"Error.*?(?=\n\n|\Z)", output, re.DOTALL)[:3]:
-            errors.append(f"Compilation: {match.strip()[:200]}")
-
-    return errors or ["Unknown failure - check test output"]
+# --- gates -------------------------------------------------------------------
 
 
-def get_bytecode(contract_path: Path, contract_name: str) -> str:
-    """Extract deployed bytecode for a contract."""
-    # forge expects the path relative to the Foundry workspace.
-    rel_path = os.path.relpath(contract_path, config.FOUNDRY_DIR)
-    returncode, stdout, stderr = run_forge(
-        ["inspect", f"{rel_path}:{contract_name}", "deployedBytecode"]
+def _parse_gas(suites: dict) -> list[GasEntry]:
+    entries: list[GasEntry] = []
+    for _, _, result in _iter_tests(suites):
+        for log in result.get("decoded_logs") or []:
+            if not log.startswith(GAS_LOG_PREFIX):
+                continue
+            _, signature, original, candidate, ok_a, ok_b = log.split("|")
+            entries.append(
+                GasEntry(
+                    signature=signature,
+                    original=int(original),
+                    candidate=int(candidate),
+                    original_ok=ok_a == "1",
+                    candidate_ok=ok_b == "1",
+                )
+            )
+    entries.sort(key=lambda e: e.signature)
+    return entries
+
+
+def _first_failure(suites: dict) -> tuple[str, str, str] | None:
+    """(test name, reason, counterexample) for the first failing test."""
+    for _, test_name, result in _iter_tests(suites):
+        if result.get("status") == "Success":
+            continue
+        reason = result.get("reason") or "test failed without a reason"
+        counterexample = result.get("counterexample")
+        detail = ""
+        if counterexample:
+            single = counterexample.get("Single") if isinstance(counterexample, dict) else None
+            payload = single or counterexample
+            args = payload.get("args") if isinstance(payload, dict) else None
+            calldata = payload.get("calldata") if isinstance(payload, dict) else None
+            detail = f"args={args}" if args else f"calldata={calldata}"
+        return test_name, reason, detail
+    return None
+
+
+def _run_equivalence(settings: dict) -> tuple[bool, dict | None]:
+    timeout = settings["forge_timeout"]
+    suites, raw = _forge_test_json(
+        ["test", "--match-contract", "EquivalenceTest", "--fuzz-runs", str(settings["fuzz_runs"])],
+        timeout,
     )
 
-    if returncode != 0:
-        raise RuntimeError(f"Failed to get bytecode: {stderr}")
+    if not suites:
+        compiled = "Compiler run failed" not in raw and "Error (" not in raw
+        return False, _failure(
+            "compile_error" if not compiled else "test_error",
+            "forge produced no test results",
+            compile_ok=compiled,
+            test="EquivalenceTest",
+            trace=raw[-1500:],
+        )
 
-    return stdout.strip()
+    total = sum(len(s.get("test_results") or {}) for s in suites.values())
+    if total == 0:
+        # A harness with no tests passes trivially. That is not evidence.
+        return False, _failure(
+            "harness_error",
+            "the generated equivalence harness contains no tests",
+            test="EquivalenceTest",
+        )
+
+    failure = _first_failure(suites)
+    if failure:
+        test_name, reason, detail = failure
+        return False, _failure(
+            "equivalence_error",
+            reason,
+            test=test_name,
+            trace=detail or reason,
+        )
+
+    return True, None
 
 
-def kill_process_tree(pid: int) -> None:
-    """Kill a process and all its children."""
+def _run_gas_bench(settings: dict) -> tuple[list[GasEntry], dict | None]:
+    timeout = settings["forge_timeout"]
+    suites, raw = _forge_test_json(
+        ["test", "--match-contract", "GasBench", "--isolate"], timeout
+    )
+
+    if not suites:
+        return [], _failure(
+            "gas_error",
+            "the gas benchmark produced no results",
+            test="GasBench",
+            trace=raw[-1500:],
+        )
+
+    entries = _parse_gas(suites)
+    failure = _first_failure(suites)
+
+    if failure:
+        test_name, reason, detail = failure
+        return entries, _failure("gas_error", reason, test=test_name, trace=detail or reason)
+
+    if not entries:
+        return entries, _failure(
+            "gas_error",
+            "no gas measurements were produced",
+            test="GasBench",
+        )
+
+    if settings.get("require_gas_improvement", True) and not any(e.improved for e in entries):
+        detail = "; ".join(e.describe() for e in entries)
+        return entries, _failure(
+            "gas_error",
+            "the candidate is not cheaper than the original on any function",
+            test="GasBench",
+            trace=detail,
+        )
+
+    return entries, None
+
+
+# --- hevm (advisory) ---------------------------------------------------------
+
+
+def _kill_process_tree(pid: int) -> None:
     try:
         os.killpg(os.getpgid(pid), signal.SIGKILL)
     except (ProcessLookupError, PermissionError, AttributeError):
@@ -208,25 +409,24 @@ def kill_process_tree(pid: int) -> None:
         pass
 
 
-def run_hevm_equivalence(original_bin: Path, candidate_bin: Path,
-                         settings: dict) -> Tuple[bool, List[str]]:
-    """
-    Run the hevm equivalence check.
-    Returns: (is_equivalent, counterexamples)
-    """
-    timeout = settings.get("hevm_timeout", 300)
+def _run_hevm(
+    original_bin: Path, candidate_bin: Path, settings: dict
+) -> tuple[bool, list[str], str]:
+    """Return (equivalent, counterexamples, note).
 
+    `note` is non-empty when the check could not reach a verdict; callers must
+    treat that as "skipped", not as evidence against the candidate.
+    """
     cmd = [
         "hevm", "equivalence",
         "--code-a-file", str(original_bin),
         "--code-b-file", str(candidate_bin),
-        "--smttimeout", str(settings.get("hevm_solver_timeout", 30000)),
-        "--max-iterations", str(settings.get("hevm_max_iterations", 5)),
+        "--smttimeout", str(settings["hevm_solver_timeout"]),
+        "--max-iterations", str(settings["hevm_max_iterations"]),
     ]
 
     process = None
     try:
-        # New process group so a timeout can take down the whole solver tree.
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -234,223 +434,232 @@ def run_hevm_equivalence(original_bin: Path, candidate_bin: Path,
             text=True,
             preexec_fn=os.setsid if hasattr(os, "setsid") else None,
         )
-
-        stdout, _ = process.communicate(timeout=timeout)
+        stdout, _ = process.communicate(timeout=settings["hevm_timeout"])
 
         if process.returncode == 0:
-            return True, []
+            return True, [], ""
 
         counterexamples = [
-            line.strip() for line in stdout.split("\n")
+            line.strip()
+            for line in stdout.splitlines()
             if "not equal" in line.lower() or "counterexample" in line.lower()
         ]
-        return False, counterexamples or ["Equivalence check failed"]
+        if counterexamples:
+            return False, counterexamples, ""
+        return False, [], "hevm exited non-zero without a counterexample"
 
     except subprocess.TimeoutExpired:
         if process:
-            kill_process_tree(process.pid)
+            _kill_process_tree(process.pid)
             try:
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 pass
-        return False, []  # Timeout - no counterexamples
+        return False, [], f"hevm timed out after {settings['hevm_timeout']}s"
 
     except FileNotFoundError:
-        return False, ["hevm not installed"]
+        return False, [], "hevm is not installed; symbolic check skipped"
 
-    except Exception as e:
+    except OSError as exc:
         if process:
-            kill_process_tree(process.pid)
-        return False, [f"Error: {str(e)}"]
+            _kill_process_tree(process.pid)
+        return False, [], f"hevm could not be run ({exc}); symbolic check skipped"
 
 
-def run_hevm_validation(original_path: Path, candidate_path: Path,
-                        original_contract: str, candidate_contract: str,
-                        settings: dict) -> Tuple[bool, List[str]]:
-    """Compile both contracts, dump bytecode, and prove equivalence with hevm."""
-    original_bin = config.FOUNDRY_DIR / f"{original_contract}.bin"
-    candidate_bin = config.FOUNDRY_DIR / f"{candidate_contract}.bin"
+def _hevm_gate(
+    original: artifacts.ContractArtifact,
+    candidate: artifacts.ContractArtifact,
+    settings: dict,
+) -> tuple[dict | None, list[str]]:
+    """Bytecode comes straight from the build artifact — no `forge inspect`
+    output parsing, which changes shape between Foundry releases."""
+    notes: list[str] = []
 
+    original_code = original.deployed_bytecode.removeprefix("0x")
+    candidate_code = candidate.deployed_bytecode.removeprefix("0x")
+
+    if not original_code or not candidate_code:
+        return None, ["one side has empty deployed bytecode; symbolic check skipped"]
+    if original_code == candidate_code:
+        return None, ["bytecode identical; symbolic check trivially satisfied"]
+
+    original_bin = config.FOUNDRY_DIR / f"{original.name}.bin"
+    candidate_bin = config.FOUNDRY_DIR / f"{candidate.name}.bin"
     try:
-        returncode, _, stderr = run_forge(["build"])
-        if returncode != 0:
-            return False, [f"Compilation failed: {stderr}"]
-
-        original_code = get_bytecode(original_path, original_contract)
-        candidate_code = get_bytecode(candidate_path, candidate_contract)
-
-        if not original_code or original_code == "0x":
-            return False, [f"Empty bytecode for {original_contract}"]
-        if not candidate_code or candidate_code == "0x":
-            return False, [f"Empty bytecode for {candidate_contract}"]
-
-        # Identical bytecode is trivially equivalent — skip the solver.
-        if original_code == candidate_code:
-            return True, []
-
         original_bin.write_text(original_code)
         candidate_bin.write_text(candidate_code)
-
-        return run_hevm_equivalence(original_bin, candidate_bin, settings)
-
-    except Exception as e:
-        return False, [f"Error: {str(e)}"]
-
+        equivalent, counterexamples, note = _run_hevm(original_bin, candidate_bin, settings)
     finally:
-        cleanup_files(original_bin, candidate_bin)
+        original_bin.unlink(missing_ok=True)
+        candidate_bin.unlink(missing_ok=True)
+
+    if note:
+        notes.append(note)
+        return None, notes
+    if equivalent:
+        notes.append("hevm proved the two bytecodes equivalent")
+        return None, notes
+
+    return _failure(
+        "symbolic_counterexample",
+        counterexamples[0],
+        test="hevm",
+        trace="\n".join(counterexamples[:3]),
+    ), notes
 
 
-def cleanup_files(*files: Path) -> None:
-    """Remove temporary files."""
-    for f in files:
-        try:
-            Path(f).unlink(missing_ok=True)
-        except OSError:
-            pass
+# --- entry point -------------------------------------------------------------
 
 
-def _failure(compile_status: str, test: str, failure_type: str,
-             error: str, trace: str = "") -> dict:
-    return {
-        "compile": compile_status,
-        "test": test,
-        "type": failure_type,
-        "error": error,
-        "trace": trace,
-    }
-
-
-def validate(original_path: Path | str, candidate_path: Path | str) -> Tuple[bool, Optional[dict]]:
-    """
-    Main validation entry point.
-
-    Args:
-        original_path: Path to original Solidity file
-        candidate_path: Path to candidate/optimized Solidity file
-
-    Returns:
-        (True, None) if equivalent, else (False, failure_dict) with retry details.
-    """
-    settings = load_config()
+def validate(
+    original_path: Path | str,
+    candidate_path: Path | str,
+    settings: dict | None = None,
+    verbose: bool = True,
+) -> ValidationResult:
+    """Run every gate against a contract pair."""
+    settings = settings or load_config()
 
     original_path = Path(original_path).resolve()
     candidate_path = Path(candidate_path).resolve()
 
-    original_contract = extract_contract_name(original_path)
-    candidate_contract = extract_contract_name(candidate_path)
+    def say(message: str) -> None:
+        if verbose:
+            print(message)
 
-    if not original_contract:
-        return False, _failure("false", "N/A", "parse_error",
-                               f"Could not extract contract name from {original_path}")
-    if not candidate_contract:
-        return False, _failure("false", "N/A", "parse_error",
-                               f"Could not extract contract name from {candidate_path}")
+    original_name = _contract_name(original_path)
+    candidate_name = _contract_name(candidate_path)
+    if not original_name:
+        return ValidationResult(
+            False,
+            _failure("parse_error", f"no contract declared in {original_path}", compile_ok=False),
+        )
+    if not candidate_name:
+        return ValidationResult(
+            False,
+            _failure("parse_error", f"no contract declared in {candidate_path}", compile_ok=False),
+        )
+    if original_name == candidate_name:
+        return ValidationResult(
+            False,
+            _failure(
+                "shape_error",
+                f"original and candidate both declare `{original_name}`; the candidate must be "
+                f"renamed or it overwrites the original and gets compared to itself",
+                compile_ok=False,
+            ),
+        )
 
-    print(f"[VALIDATE] Original: {original_contract} ({original_path})")
-    print(f"[VALIDATE] Candidate: {candidate_contract} ({candidate_path})")
-
-    # Foundry only compiles what lives under its src/ dir.
-    config.SOL_FOLDER.mkdir(parents=True, exist_ok=True)
-    config.TEST_FOLDER.mkdir(parents=True, exist_ok=True)
-
-    src_original = config.SOL_FOLDER / f"{original_contract}.sol"
-    src_candidate = config.SOL_FOLDER / f"{candidate_contract}.sol"
-
-    if original_path != src_original:
-        src_original.write_text(original_path.read_text())
-    if candidate_path != src_candidate:
-        src_candidate.write_text(candidate_path.read_text())
-
-    print("[VALIDATE] Generating fuzz tests...")
-    success, error = generate_fuzz_test(
-        src_original, src_candidate,
-        original_contract, candidate_contract,
-        config.EQUIVALENCE_TEST_PATH, settings,
+    say(
+        f"[VALIDATE] {original_name} ({original_path.name}) vs "
+        f"{candidate_name} ({candidate_path.name})"
     )
-    if not success:
-        return False, _failure("false", "N/A", "generator_error", error)
 
-    print(f"[VALIDATE] Running fuzz tests ({settings['fuzz_runs']} runs)...")
-    success, errors = run_fuzz_tests(settings["fuzz_runs"])
+    src_original, src_candidate = prepare_workspace(original_path, candidate_path)
 
-    if not success:
-        error_text = "\n".join(errors)
-
-        if "Compiler run failed" in error_text or "compilation" in error_text.lower():
-            failure_type, compile_status = "compile_error", "false"
-        elif "counterexample" in error_text.lower():
-            failure_type, compile_status = "equivalence_error", "true"
-        elif "assertion" in error_text.lower():
-            failure_type, compile_status = "assertion_error", "true"
-        else:
-            failure_type, compile_status = "test_error", "true"
-
-        return False, _failure(
-            compile_status, "EquivalenceTest", failure_type,
-            errors[0] if errors else "Unknown error",
-            "\n".join(errors[:3]),
+    say("[VALIDATE] Building...")
+    returncode, stdout, stderr = run_forge(["build"], timeout=settings["forge_timeout"])
+    if returncode != 0:
+        return ValidationResult(
+            False,
+            _failure(
+                "compile_error",
+                "the candidate does not compile",
+                compile_ok=False,
+                trace=(stdout + stderr)[-1500:],
+            ),
         )
 
-    print("[VALIDATE] Fuzz tests passed!")
+    try:
+        original_artifact = artifacts.load(src_original, original_name)
+        candidate_artifact = artifacts.load(src_candidate, candidate_name)
+    except artifacts.ArtifactError as exc:
+        return ValidationResult(False, _failure("harness_error", str(exc)))
 
+    say("[VALIDATE] Generating equivalence + gas harness...")
+    try:
+        harness = harness_generator.generate(
+            original_artifact, candidate_artifact, settings["max_array_length"]
+        )
+    except harness_generator.GenerationError as exc:
+        return ValidationResult(False, _failure("harness_error", str(exc)))
+
+    for name, source in harness.files.items():
+        (config.TEST_FOLDER / name).write_text(source, encoding="utf-8")
+    say(f"[VALIDATE] Covering {len(harness.covered)} function(s): {', '.join(harness.covered)}")
+
+    say(f"[VALIDATE] Differential fuzzing ({settings['fuzz_runs']} runs)...")
+    equivalent, failure = _run_equivalence(settings)
+    if not equivalent:
+        return ValidationResult(False, failure)
+    say("[VALIDATE] Equivalence holds.")
+
+    say("[VALIDATE] Measuring gas...")
+    gas, failure = _run_gas_bench(settings)
+    if failure:
+        return ValidationResult(False, failure, gas=gas)
+    say("[VALIDATE] Gas gate passed:")
+    if verbose:
+        print(ValidationResult(True, gas=gas).gas_summary())
+
+    notes: list[str] = []
     if settings.get("hevm_enabled", False):
-        print("[VALIDATE] Running hevm symbolic check...")
-        success, counterexamples = run_hevm_validation(
-            src_original, src_candidate,
-            original_contract, candidate_contract,
-            settings,
-        )
+        say("[VALIDATE] Running hevm symbolic check...")
+        failure, notes = _hevm_gate(original_artifact, candidate_artifact, settings)
+        for note in notes:
+            say(f"[VALIDATE] {note}")
+        if failure:
+            return ValidationResult(False, failure, gas=gas, notes=notes)
 
-        if not success:
-            if counterexamples:
-                return False, _failure(
-                    "true", "hevm", "symbolic_counterexample",
-                    counterexamples[0], "\n".join(counterexamples[:3]),
-                )
-            # Timeout with no counterexample: inconclusive, but fuzzing passed.
-            print("[VALIDATE] Hevm timed out - treating as passed (fuzz tests passed)")
-
-    print("[VALIDATE] Validation passed!")
-    return True, None
+    return ValidationResult(True, None, gas=gas, notes=notes)
 
 
-def main() -> None:
-    """CLI for standalone validation and config tweaking."""
-    if len(sys.argv) < 2:
-        print("Usage: python -m gas_optimizer.validator <original.sol> <candidate.sol>")
-        print("       python -m gas_optimizer.validator --hevm-enable")
-        print("       python -m gas_optimizer.validator --hevm-disable")
-        print("       python -m gas_optimizer.validator --config")
-        sys.exit(1)
+# --- standalone CLI ----------------------------------------------------------
 
-    arg = sys.argv[1]
+_USAGE = """Usage:
+  python -m gas_optimizer.validator <original.sol> <candidate.sol>
+  python -m gas_optimizer.validator --config
+  python -m gas_optimizer.validator --hevm-enable | --hevm-disable
+"""
 
-    if arg in ("--hevm-enable", "--hevm-disable"):
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+
+    if not argv:
+        print(_USAGE)
+        return 1
+
+    if argv[0] in ("--hevm-enable", "--hevm-disable"):
         settings = load_config()
-        settings["hevm_enabled"] = arg == "--hevm-enable"
+        settings["hevm_enabled"] = argv[0] == "--hevm-enable"
         save_config(settings)
-        print(f"Hevm {'ENABLED' if settings['hevm_enabled'] else 'DISABLED'}")
-        sys.exit(0)
+        print(f"hevm {'enabled' if settings['hevm_enabled'] else 'disabled'}")
+        return 0
 
-    if arg == "--config":
-        print("Current Configuration:")
-        for k, v in load_config().items():
-            print(f"  {k}: {v}")
-        sys.exit(0)
+    if argv[0] == "--config":
+        for key, value in load_config().items():
+            print(f"  {key}: {_render(value)}")
+        return 0
 
-    if len(sys.argv) < 3:
-        print("Usage: python -m gas_optimizer.validator <original.sol> <candidate.sol>")
-        sys.exit(1)
+    if len(argv) < 2:
+        print(_USAGE)
+        return 1
 
-    is_valid, failure_data = validate(sys.argv[1], sys.argv[2])
+    result = validate(argv[0], argv[1])
 
-    if is_valid:
-        print("\nVALID: Contracts are equivalent")
-        sys.exit(0)
+    if result.ok:
+        print("\nACCEPTED: equivalent and cheaper")
+        print(result.gas_summary())
+        return 0
 
-    print(f"\nINVALID: {failure_data}")
-    sys.exit(1)
+    print(f"\nREJECTED [{result.failure['type']}]: {result.failure['error']}")
+    if result.failure.get("trace"):
+        print(result.failure["trace"])
+    if result.gas:
+        print(result.gas_summary())
+    return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
