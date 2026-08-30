@@ -1,0 +1,14 @@
+// SPDX-License-Identifier: GPL-3.0
+pragma solidity ^0.8.20;
+
+contract Airdrop {
+	mapping(address => uint) public balanceOf;
+	uint public totalSent;
+
+	function airdrop(address[] calldata to, uint amount) external {
+		for (uint i = 0; i < to.length; i++) {
+			balanceOf[to[i]] += amount;
+			totalSent += amount;
+		}
+	}
+}
