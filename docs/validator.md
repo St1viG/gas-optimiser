@@ -13,10 +13,16 @@ structured failure that the optimizer feeds back to the model.
 | --- | --- | --- |
 | Declared name differs from the original | `shape_error` | A candidate that would overwrite the original and be compared against itself |
 | `forge build` | `compile_error` | Source that does not compile |
+| `forge build` | `environment_error` | `forge` missing or timing out — the model cannot fix this, so the loop stops immediately instead of retrying |
 | Harness generation | `harness_error` | A changed public ABI, or a parameter type the harness cannot drive |
-| Differential fuzzing | `equivalence_error` | Any behavioural difference |
-| Gas benchmark | `gas_error` | A regression, or no improvement at all |
+| Differential fuzzing | `equivalence_error` | Any behavioural difference — views included |
+| Gas benchmark | `gas_error` | A regression on any function, or no improvement at all |
 | `hevm equivalence` (optional) | `symbolic_counterexample` | Divergence the fuzzer missed |
+
+Progress is reported as structured events (`gas_optimizer/events.py`):
+`GateStarted`/`GatePassed`/`GateFailed` per gate, plus notes. The console
+output, `--stream-json`, the TUI and the web GUI are all renderers over the
+same stream.
 
 ## Introspection
 
@@ -37,7 +43,8 @@ order are wrong for all four.
 - `EquivalenceTest.t.sol` — differential fuzz tests
 - `GasBench.t.sol` — deterministic gas comparison
 
-Each mutating function is exercised like this:
+Every public function — views and pure functions included — is exercised like
+this:
 
 ```solidity
 bytes memory payload = abi.encodeWithSignature("transfer(address,uint256)", to, val);
@@ -70,6 +77,16 @@ Both are needed. Bounding everything hides unsound `unchecked` arithmetic;
 bounding nothing means almost every input reverts on both sides and proves
 little.
 
+### Views are verified twice
+
+View functions get their own fuzz tests over the seeded state, exactly like
+mutating functions — a getter that returns the wrong value is a `returndata
+mismatch`. On top of that, every **mutating** test ends with a sweep that calls
+each zero-argument view on both contracts and compares status and return bytes
+(`_assertViewsMatch`). The sweep runs over *mutated* state, which the seeder
+never produces — it is what catches a getter that only lies after a state
+change. The `Counter`/`CounterBadView` fixture pair pins this behaviour.
+
 ### State seeding
 
 Mappings and full-width scalar slots are seeded to `SEED` (`1_000_000 ether`) on
@@ -88,16 +105,18 @@ is rejected. A harness that emits zero tests is likewise a failure, not a pass.
 
 ## The gas gate
 
-`GasBench.t.sol` measures each function once with fixed representative
-arguments, under `forge test --isolate`. Each measurement:
+`GasBench.t.sol` measures each function — views included — once with fixed
+representative arguments, under `forge test --isolate`. Each measurement:
 
 1. logs `GASRESULT|<signature>|<original>|<candidate>|<okA>|<okB>` for the
    Python side to parse;
 2. asserts `assertLe(candidateGas, originalGas)`, so a regression fails on its own.
 
 Python additionally requires at least one function to be **strictly** cheaper.
-Set `require_gas_improvement=false` in `validatorConfig.txt` to measure and
-report without blocking.
+Because views are measured, a saving confined to a getter satisfies the gate
+(the `Registry`/`RegistryViewOpt` fixture pins this). Set
+`validator.require_gas_improvement = false` in `gas-optimizer.toml` to measure
+and report without blocking.
 
 `foundry.toml` enables the solc optimizer. Gas measured with it off does not
 describe any real deployment.
@@ -151,32 +170,31 @@ brew install z3
 
 ## Configuration
 
-`validatorConfig.txt`:
-
-| Key | Meaning |
-| --- | --- |
-| `fuzz_runs` | Fuzz iterations per generated test |
-| `require_gas_improvement` | Reject candidates that are not strictly cheaper |
-| `forge_timeout` | Per-command timeout for `forge`, in seconds |
-| `max_array_length` | Cap applied to fuzzed dynamic arrays |
-| `hevm_enabled` | Run the symbolic check |
-| `hevm_timeout` | Overall hevm timeout (seconds) |
-| `hevm_solver` | SMT solver: `z3`, `bitwuzla` or `cvc5` |
-| `hevm_smt_timeout` | Per-query SMT timeout, in **seconds** (`--smt-timeout`) |
-| `hevm_max_iterations` | Loop-unroll bound |
+Settings live in `gas-optimizer.toml` (template: `gas-optimizer.example.toml`),
+resolved as CLI flag > `GAS_OPTIMIZER_*` environment > file > defaults — see
+the README's configuration table for every key. A legacy `validatorConfig.txt`
+is still read with a deprecation warning; convert it with
+`gas-optimize config migrate`.
 
 ## Usage
 
 ```bash
 # compare two contracts directly, no model involved
-python -m gas_optimizer.validator tests/fixtures/ERC20.sol tests/fixtures/ERC20Candidate.sol
+gas-optimize validate tests/fixtures/ERC20.sol tests/fixtures/ERC20Candidate.sol
 
-python -m gas_optimizer.validator --config
-python -m gas_optimizer.validator --hevm-enable
-python -m gas_optimizer.validator --hevm-disable
+# per-run overrides
+gas-optimize validate a.sol b.sol --fuzz-runs 500 --hevm
+gas-optimize validate a.sol b.sol --json
+
+# inspect or persist settings
+gas-optimize config show
+gas-optimize config set hevm.enabled true
 ```
 
-Exit code is `0` when the candidate is accepted, `1` otherwise.
+Exit code is `0` when the candidate is accepted, `1` when rejected, and `2` for
+an environment or usage problem (`gas-optimize doctor` diagnoses those).
+`python -m gas_optimizer.validator` remains as a deprecated shim over the same
+commands.
 
 Programmatically:
 
@@ -186,11 +204,11 @@ from gas_optimizer import validator
 result = validator.validate("path/to/Original.sol", "path/to/Candidate.sol")
 
 if result.ok:
-    print(result.gas_summary())        # per-function deltas
+    print(result.gas_summary())  # per-function deltas
 else:
-    print(result.failure["type"])      # e.g. "equivalence_error"
-    print(result.failure["error"])     # the assertion that fired
-    print(result.failure["trace"])     # counterexample arguments
+    print(result.failure["type"])  # e.g. "equivalence_error"
+    print(result.failure["error"])  # the assertion that fired
+    print(result.failure["trace"])  # counterexample arguments
 ```
 
 ## Workspace
