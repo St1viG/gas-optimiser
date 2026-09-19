@@ -2,6 +2,11 @@
 .env
 .env.local
 
+# --- Local configuration and run history ---
+# The tracked template is gas-optimizer.example.toml.
+gas-optimizer.toml
+runs/
+
 # --- Python ---
 __pycache__/
 *.py[cod]

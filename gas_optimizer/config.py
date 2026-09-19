@@ -13,7 +13,11 @@ from pathlib import Path
 # --- Paths -------------------------------------------------------------------
 
 PACKAGE_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = PACKAGE_DIR.parent
+
+# The tool needs the repo checkout around it (foundry workspace, config,
+# test-cases); GAS_OPTIMIZER_HOME points elsewhere for non-standard layouts.
+_home_override = os.environ.get("GAS_OPTIMIZER_HOME", "").strip()
+PROJECT_ROOT = Path(_home_override).resolve() if _home_override else PACKAGE_DIR.parent
 
 # Foundry workspace. `forge` is always invoked with this as its cwd.
 FOUNDRY_DIR = PROJECT_ROOT / "foundry"
@@ -23,8 +27,15 @@ FOUNDRY_DIR = PROJECT_ROOT / "foundry"
 SOL_FOLDER = FOUNDRY_DIR / "src"
 TEST_FOLDER = FOUNDRY_DIR / "test"
 
-# Validator tunables (fuzz runs, gas gate, hevm toggles).
+# Legacy validator tunables; superseded by gas-optimizer.toml (see settings.py).
 VALIDATOR_CONFIG_PATH = PROJECT_ROOT / "validatorConfig.txt"
+
+# Layered TOML configuration (gitignored; the tracked template is
+# gas-optimizer.example.toml).
+CONFIG_TOML_PATH = PROJECT_ROOT / "gas-optimizer.toml"
+
+# Persisted run history: one directory per optimization run.
+RUNS_DIR = PROJECT_ROOT / "runs"
 
 # Test-case inputs.
 TEST_CASES_DIR = PROJECT_ROOT / "test-cases"

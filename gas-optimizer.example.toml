@@ -1,0 +1,38 @@
+# gas-optimizer configuration template.
+#
+# Copy to gas-optimizer.toml (gitignored) and edit, or run:
+#     gas-optimize config init
+#
+# Precedence: CLI flag > environment (GAS_OPTIMIZER_*) > this file > defaults.
+# Every key is optional; omitted keys keep their defaults, shown below.
+
+[validator]
+# Differential fuzzing runs per equivalence test.
+fuzz_runs = 2000
+# Longest driven array argument.
+max_array_length = 5
+# Reject candidates that are not strictly cheaper on at least one function.
+require_gas_improvement = true
+# Seconds before a forge invocation is abandoned.
+forge_timeout = 900
+
+[hevm]
+# Symbolic equivalence check (advisory; needs hevm + an SMT solver installed).
+enabled = false
+# Seconds before the whole hevm run is killed.
+timeout = 300
+# Per-query SMT solver timeout, in seconds.
+smt_timeout = 30
+solver = "z3"
+max_iterations = 5
+
+[llm]
+model = "Qwen/Qwen2.5-Coder-32B-Instruct"
+# Attempts at the optimize-and-verify loop.
+max_retries = 5
+# Attempts at a single API call before giving up on it.
+api_retries = 3
+
+[gui]
+host = "127.0.0.1"
+port = 8765
