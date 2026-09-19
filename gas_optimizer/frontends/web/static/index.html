@@ -1,0 +1,797 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gas-optimizer</title>
+<style>
+  :root {
+    --bg: #101014;
+    --panel: #17171c;
+    --raised: #1e1e24;
+    --border: #2a2a32;
+    --text: #e6e6eb;
+    --muted: #8b8b96;
+    --accent: #7aa2ff;
+    --good: #3fb950;
+    --good-dim: rgba(63, 185, 80, 0.14);
+    --bad: #f85149;
+    --bad-dim: rgba(248, 81, 73, 0.12);
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: flex;
+    overflow: hidden;
+  }
+  button { font: inherit; color: inherit; background: none; border: none; cursor: pointer; }
+  button:focus-visible, textarea:focus-visible, input:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 1px;
+  }
+
+  /* ---------- sidebar ---------- */
+  #sidebar {
+    width: 264px;
+    flex: none;
+    background: var(--panel);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+  #sidebar header { padding: 14px 14px 8px; }
+  #brand { font-weight: 600; letter-spacing: 0.01em; }
+  #brand span { color: var(--muted); font-weight: 400; }
+  #new-run {
+    margin: 8px 14px 10px;
+    padding: 9px 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    text-align: left;
+    background: var(--raised);
+  }
+  #new-run:hover { border-color: var(--muted); }
+  #history { flex: 1; overflow-y: auto; padding: 0 8px 12px; }
+  .history-item {
+    display: block;
+    width: 100%;
+    padding: 8px 8px;
+    border-radius: 8px;
+    text-align: left;
+  }
+  .history-item:hover { background: var(--raised); }
+  .history-item.selected { background: var(--raised); }
+  .history-top { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+  .history-name { font-family: var(--mono); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .history-sub { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .pill {
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 1px 7px;
+    border-radius: 999px;
+    flex: none;
+  }
+  .pill.saved { color: var(--good); background: var(--good-dim); }
+  .pill.rejected { color: var(--bad); background: var(--bad-dim); }
+  .pill.running { color: var(--accent); background: rgba(122, 162, 255, 0.12); }
+  .pill.incomplete { color: var(--muted); background: var(--raised); }
+
+  /* ---------- main ---------- */
+  #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #banner {
+    display: none;
+    padding: 8px 20px;
+    background: var(--bad-dim);
+    color: var(--text);
+    font-size: 13px;
+    border-bottom: 1px solid var(--border);
+  }
+  #banner.on { display: block; }
+  #banner code { font-family: var(--mono); }
+  #chat { flex: 1; overflow-y: auto; min-height: 0; }
+  #thread { max-width: 780px; margin: 0 auto; padding: 24px 20px 12px; }
+
+  #empty { text-align: center; color: var(--muted); margin-top: 18vh; }
+  #empty h1 { font-size: 21px; font-weight: 600; color: var(--text); margin: 0 0 6px; }
+  #empty p { margin: 0; }
+
+  .msg { margin-bottom: 20px; }
+  .msg .who { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+
+  .user-bubble {
+    background: var(--raised);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+  }
+  .user-bubble summary {
+    padding: 10px 14px;
+    cursor: pointer;
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--muted);
+    list-style: none;
+  }
+  .user-bubble summary::-webkit-details-marker { display: none; }
+  .user-bubble pre { margin: 0; border-top: 1px solid var(--border); }
+
+  pre.code {
+    font-family: var(--mono);
+    font-size: 12.5px;
+    line-height: 1.55;
+    padding: 12px 14px;
+    overflow-x: auto;
+    white-space: pre;
+    margin: 0;
+  }
+
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 12px 14px;
+    margin-bottom: 10px;
+  }
+  .card h3 { margin: 0 0 8px; font-size: 13.5px; font-weight: 600; }
+  .card h3 .why { color: var(--muted); font-weight: 400; }
+
+  .gate { display: flex; gap: 9px; align-items: baseline; padding: 2px 0; font-size: 13.5px; }
+  .gate .glyph { font-family: var(--mono); width: 14px; flex: none; }
+  .gate.pending .glyph { color: var(--muted); }
+  .gate.active .glyph { color: var(--accent); }
+  .gate.passed .glyph { color: var(--good); }
+  .gate.failed .glyph { color: var(--bad); }
+  .gate .detail { color: var(--muted); font-size: 12.5px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .gate.active .glyph { display: inline-block; animation: spin 1.2s linear infinite; }
+  @media (prefers-reduced-motion: reduce) { .gate.active .glyph { animation: none; } }
+
+  .feedback { border-left: 3px solid var(--bad); }
+  .feedback .ftype { font-family: var(--mono); color: var(--bad); font-size: 12.5px; }
+  .feedback pre { margin: 8px 0 0; color: var(--muted); }
+
+  .verdict-accepted { border-left: 3px solid var(--good); }
+  .verdict-rejected { border-left: 3px solid var(--bad); }
+  .verdict-note { color: var(--muted); font-size: 13px; margin-top: 6px; }
+
+  table.gas { border-collapse: collapse; width: 100%; margin: 8px 0 4px; font-size: 13px; }
+  table.gas th {
+    text-align: left; font-weight: 500; color: var(--muted);
+    padding: 4px 10px 4px 0; border-bottom: 1px solid var(--border);
+  }
+  table.gas td { font-family: var(--mono); font-size: 12.5px; padding: 5px 10px 5px 0; }
+  table.gas td.num { text-align: right; }
+  table.gas th.num { text-align: right; }
+  .delta-good { color: var(--good); }
+  .delta-bad { color: var(--bad); }
+  .delta-zero { color: var(--muted); }
+
+  .diffwrap { border: 1px solid var(--border); border-radius: 8px; margin-top: 10px; overflow: hidden; }
+  .diffwrap pre { max-height: 340px; overflow: auto; }
+  .dl-add { color: var(--good); }
+  .dl-del { color: var(--bad); }
+  .dl-hunk { color: var(--accent); }
+  .dl-meta { color: var(--muted); }
+
+  .card-actions { display: flex; gap: 8px; margin-top: 10px; }
+  .card-actions button {
+    font-size: 12.5px;
+    padding: 5px 10px;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+  }
+  .card-actions button:hover { border-color: var(--muted); }
+
+  /* ---------- composer ---------- */
+  #composer-zone { border-top: 1px solid var(--border); background: var(--bg); }
+  #composer { max-width: 780px; margin: 0 auto; padding: 12px 20px 14px; }
+  #dropbox {
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    background: var(--panel);
+  }
+  #dropbox.dragging { border-color: var(--accent); }
+  #source {
+    display: block;
+    width: 100%;
+    min-height: 68px;
+    max-height: 40vh;
+    resize: none;
+    border: none;
+    background: transparent;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.55;
+    padding: 12px 14px 4px;
+  }
+  #source::placeholder { color: var(--muted); font-family: inherit; }
+  #composer-bar { display: flex; align-items: center; gap: 6px; padding: 6px 8px 8px; }
+  #composer-bar .spacer { flex: 1; }
+  .iconbtn {
+    color: var(--muted);
+    padding: 6px 9px;
+    border-radius: 7px;
+    font-size: 13px;
+  }
+  .iconbtn:hover { color: var(--text); background: var(--raised); }
+  #optimize {
+    background: var(--accent);
+    color: #0d1220;
+    font-weight: 600;
+    padding: 7px 16px;
+    border-radius: 9px;
+  }
+  #optimize:disabled { opacity: 0.45; cursor: default; }
+  #cancel { display: none; color: var(--bad); }
+  #cancel.on { display: inline-block; }
+  #hint { color: var(--muted); font-size: 12px; padding: 6px 4px 0; text-align: center; }
+
+  /* settings popover */
+  #settings-wrap { position: relative; }
+  #settings {
+    position: absolute;
+    bottom: 40px;
+    right: 0;
+    width: 240px;
+    background: var(--raised);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px;
+    display: none;
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.5);
+  }
+  #settings.on { display: block; }
+  #settings label { display: block; font-size: 12.5px; color: var(--muted); margin: 8px 0 3px; }
+  #settings label:first-child { margin-top: 0; }
+  #settings input[type=number], #settings input[type=text] {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 13px;
+    padding: 5px 8px;
+  }
+  #settings .row { display: flex; align-items: center; justify-content: space-between; margin-top: 10px; }
+  #settings .row label { margin: 0; }
+
+  #toast {
+    position: fixed;
+    bottom: 18px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--raised);
+    border: 1px solid var(--border);
+    border-radius: 9px;
+    padding: 9px 16px;
+    font-size: 13.5px;
+    display: none;
+    max-width: 70vw;
+  }
+  #toast.on { display: block; }
+  #toast.err { border-color: var(--bad); }
+
+  @media (max-width: 760px) {
+    #sidebar { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<nav id="sidebar">
+  <header><div id="brand">gas-optimizer <span>· verify loop</span></div></header>
+  <button id="new-run">New optimization</button>
+  <div id="history" aria-label="Run history"></div>
+</nav>
+
+<div id="main">
+  <div id="banner"></div>
+  <div id="chat">
+    <div id="thread">
+      <div id="empty">
+        <h1>Optimize a Solidity contract</h1>
+        <p>Paste the contract below, or drop a .sol file. Every proposal is fuzz-verified<br>for equivalence and must measurably cut gas before it is accepted.</p>
+      </div>
+    </div>
+  </div>
+  <div id="composer-zone">
+    <div id="composer">
+      <div id="dropbox">
+        <textarea id="source" placeholder="pragma solidity ^0.8.20; contract ..." spellcheck="false"></textarea>
+        <div id="composer-bar">
+          <button class="iconbtn" id="attach" title="Attach a .sol file">Attach file</button>
+          <input type="file" id="filepick" accept=".sol,.txt" hidden>
+          <span class="spacer"></span>
+          <button class="iconbtn" id="cancel">Cancel run</button>
+          <div id="settings-wrap">
+            <button class="iconbtn" id="gear" aria-haspopup="true" aria-expanded="false">Settings</button>
+            <div id="settings" role="dialog" aria-label="Run settings">
+              <label for="opt-fuzz">Fuzz runs</label>
+              <input type="number" id="opt-fuzz" placeholder="2000" min="1">
+              <label for="opt-retries">Max retries</label>
+              <input type="number" id="opt-retries" placeholder="5" min="1">
+              <label for="opt-model">Model</label>
+              <input type="text" id="opt-model" placeholder="default from config">
+              <div class="row">
+                <label for="opt-hevm">hevm symbolic check</label>
+                <input type="checkbox" id="opt-hevm">
+              </div>
+            </div>
+          </div>
+          <button id="optimize">Optimize</button>
+        </div>
+      </div>
+      <div id="hint">Runs are verified locally with forge; one run at a time.</div>
+    </div>
+  </div>
+</div>
+
+<div id="toast" role="status"></div>
+
+<script>
+"use strict";
+
+const $ = (sel, el) => (el || document).querySelector(sel);
+const thread = $("#thread");
+const chat = $("#chat");
+
+const esc = (s) => String(s ?? "")
+  .replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")
+  .replaceAll('"', "&quot;");
+
+function el(html) {
+  const t = document.createElement("template");
+  t.innerHTML = html.trim();
+  return t.content.firstElementChild;
+}
+
+function toast(text, isError) {
+  const box = $("#toast");
+  box.textContent = text;
+  box.className = "on" + (isError ? " err" : "");
+  clearTimeout(box._t);
+  box._t = setTimeout(() => (box.className = ""), 4000);
+}
+
+function scrollDown() { chat.scrollTop = chat.scrollHeight; }
+
+function relTime(epoch) {
+  if (!epoch) return "";
+  const s = Math.max(0, (Date.now() / 1000) - epoch);
+  if (s < 60) return "just now";
+  if (s < 3600) return Math.floor(s / 60) + "m ago";
+  if (s < 86400) return Math.floor(s / 3600) + "h ago";
+  return Math.floor(s / 86400) + "d ago";
+}
+
+/* ---------- health + history ---------- */
+
+async function refreshHealth() {
+  try {
+    const health = await (await fetch("/api/health")).json();
+    const broken = health.checks.filter((c) => !c.ok && c.required);
+    const banner = $("#banner");
+    if (broken.length) {
+      banner.innerHTML = broken.map((c) =>
+        `<b>${esc(c.name)}</b>: ${esc(c.detail)}${c.hint ? " — " + esc(c.hint) : ""}`
+      ).join("<br>");
+      banner.classList.add("on");
+    } else {
+      banner.classList.remove("on");
+    }
+  } catch { /* backend gone; the next action will surface it */ }
+}
+
+let selectedRun = null;
+
+async function refreshHistory() {
+  let runs = [];
+  try { runs = await (await fetch("/api/runs")).json(); } catch { return; }
+  const box = $("#history");
+  box.innerHTML = "";
+  for (const run of runs) {
+    const cls = run.status === "accepted" ? "saved"
+      : run.status === "running" ? "running"
+      : run.status === "rejected" ? "rejected" : "incomplete";
+    const label = run.status === "accepted" ? (run.total_delta + " gas")
+      : run.status === "running" ? "running" : run.status;
+    const item = el(`<button class="history-item${run.run_id === selectedRun ? " selected" : ""}">
+      <div class="history-top">
+        <span class="history-name">${esc(run.contract)}</span>
+        <span class="pill ${cls}">${esc(label)}</span>
+      </div>
+      <div class="history-sub"><span>${relTime(run.started)}</span><span>${run.attempts ? run.attempts + " attempt" + (run.attempts > 1 ? "s" : "") : ""}</span></div>
+    </button>`);
+    item.addEventListener("click", () => openRun(run.run_id));
+    box.appendChild(item);
+  }
+}
+
+/* ---------- message building ---------- */
+
+function clearThread() {
+  thread.innerHTML = "";
+  selectedRun = null;
+}
+
+function addUserMessage(source, filename) {
+  $("#empty")?.remove();
+  const lines = source.split("\n").length;
+  const msg = el(`<div class="msg">
+    <div class="who">you</div>
+    <details class="user-bubble">
+      <summary>${esc(filename || "contract")} · ${lines} lines — click to expand</summary>
+      <pre class="code">${esc(source)}</pre>
+    </details>
+  </div>`);
+  thread.appendChild(msg);
+  scrollDown();
+}
+
+function assistantContainer() {
+  const msg = el(`<div class="msg"><div class="who">optimizer</div></div>`);
+  thread.appendChild(msg);
+  return msg;
+}
+
+const GATE_LABELS = {
+  validate: "prepare pair", build: "compile", artifacts: "read artifacts",
+  harness: "generate harness", equivalence: "differential fuzzing",
+  gas: "gas benchmark", hevm: "hevm symbolic check", parse: "parse",
+};
+
+function attemptCard(container, n, max, fixing) {
+  const why = fixing ? ` <span class="why">— fixing ${esc(fixing)}</span>` : "";
+  const card = el(`<div class="card"><h3>Attempt ${n} of ${max}${why}</h3><div class="gates"></div></div>`);
+  container.appendChild(card);
+  scrollDown();
+  return card;
+}
+
+function gateRow(card, gate, detail) {
+  const gates = $(".gates", card);
+  let row = gates.querySelector(`[data-gate="${gate}"]`);
+  if (!row) {
+    row = el(`<div class="gate pending" data-gate="${esc(gate)}">
+      <span class="glyph">○</span><span>${esc(GATE_LABELS[gate] || gate)}</span>
+      <span class="detail"></span>
+    </div>`);
+    gates.appendChild(row);
+  }
+  if (detail) $(".detail", row).textContent = detail;
+  return row;
+}
+
+function setGate(row, state, glyph) {
+  row.className = "gate " + state;
+  $(".glyph", row).textContent = glyph;
+}
+
+function feedbackCard(container, failure) {
+  const trace = failure.trace ? `<pre class="code">${esc(failure.trace)}</pre>` : "";
+  container.appendChild(el(`<div class="card feedback">
+    <div class="ftype">${esc(failure.type || "rejected")}</div>
+    <div>${esc(failure.error || "")}</div>
+    ${trace}
+    <div class="verdict-note">This feedback goes back to the model for the next attempt.</div>
+  </div>`));
+  scrollDown();
+}
+
+function deltaCell(entry) {
+  if (!entry.comparable) return `<td class="num delta-zero">n/a</td>`;
+  const cls = entry.delta < 0 ? "delta-good" : entry.delta > 0 ? "delta-bad" : "delta-zero";
+  const sign = entry.delta > 0 ? "+" : "";
+  return `<td class="num ${cls}">${sign}${entry.delta}</td>`;
+}
+
+function renderDiff(diff) {
+  return diff.split("\n").map((line) => {
+    const c = line.startsWith("+++") || line.startsWith("---") ? "dl-meta"
+      : line.startsWith("@@") ? "dl-hunk"
+      : line.startsWith("+") ? "dl-add"
+      : line.startsWith("-") ? "dl-del" : "";
+    return `<span class="${c}">${esc(line)}</span>`;
+  }).join("\n");
+}
+
+function verdictCard(container, record) {
+  if (!record.success) {
+    container.appendChild(el(`<div class="card verdict-rejected">
+      <h3>No candidate accepted</h3>
+      <div>${esc(record.message)}</div>
+    </div>`));
+    scrollDown();
+    return;
+  }
+
+  const rows = (record.gas || []).map((entry) => `<tr>
+      <td>${esc(entry.signature)}</td>
+      <td class="num">${entry.original}</td>
+      <td class="num">${entry.candidate}</td>
+      ${deltaCell(entry)}
+    </tr>`).join("");
+  const notes = (record.notes || []).map((note) =>
+    `<div class="verdict-note">${esc(note)}</div>`).join("");
+  const saved = record.output_path
+    ? `<div class="verdict-note">Saved to ${esc(record.output_path)}</div>` : "";
+
+  const card = el(`<div class="card verdict-accepted">
+    <h3>Accepted after ${record.attempts} attempt${record.attempts > 1 ? "s" : ""} · ${record.total_delta} gas</h3>
+    <table class="gas">
+      <thead><tr><th>function</th><th class="num">original</th><th class="num">candidate</th><th class="num">delta</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    ${notes}${saved}
+    <div class="diffwrap"><pre class="code">${renderDiff(record.diff || "")}</pre></div>
+    <div class="card-actions">
+      <button data-act="copy">Copy contract</button>
+      <button data-act="download">Download .sol</button>
+    </div>
+  </div>`);
+
+  const optimized = record.optimized_code;
+  if (!optimized) $(".card-actions", card).remove();
+  else {
+  $('[data-act="copy"]', card).addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(optimized); toast("Copied"); }
+    catch { toast("Copy failed", true); }
+  });
+  $('[data-act="download"]', card).addEventListener("click", () => {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([optimized], { type: "text/plain" }));
+    a.download = (record.contract || "contract") + ".optimized.sol";
+    a.click();
+    URL.revokeObjectURL(a.href);
+  });
+  }
+
+  container.appendChild(card);
+  scrollDown();
+}
+
+/* ---------- event stream ---------- */
+
+const state = { runId: null, source: "", card: null, activeGate: null, container: null, maxAttempts: 5 };
+
+function ensureCard() {
+  if (!state.card) state.card = attemptCard(state.container, 1, state.maxAttempts, null);
+  return state.card;
+}
+
+function handleEvent(ev) {
+  switch (ev.event) {
+    case "run_started":
+      state.maxAttempts = ev.max_attempts;
+      break;
+    case "attempt_started":
+      state.card = attemptCard(state.container, ev.attempt, ev.max_attempts, ev.fixing);
+      break;
+    case "llm_requested": {
+      const row = gateRow(ensureCard(), "llm", "");
+      row.querySelector("span:nth-child(2)").textContent = "request candidate (" + ev.model + ")";
+      setGate(row, "active", "◐");
+      state.activeGate = row;
+      break;
+    }
+    case "shape_rejected":
+      if (state.activeGate) setGate(state.activeGate, "failed", "✗");
+      feedbackCard(state.container, { type: "shape_error", error: (ev.problems || []).join("; ") });
+      break;
+    case "validation_started":
+      if (state.activeGate) setGate(state.activeGate, "passed", "✓");
+      break;
+    case "gate_started": {
+      const row = gateRow(ensureCard(), ev.gate, ev.detail || "");
+      setGate(row, "active", "◐");
+      state.activeGate = row;
+      break;
+    }
+    case "gate_passed": {
+      const row = gateRow(ensureCard(), ev.gate);
+      setGate(row, "passed", "✓");
+      if (ev.gate === "harness" && ev.detail) $(".detail", row).textContent = ev.detail;
+      break;
+    }
+    case "gate_failed": {
+      const row = gateRow(ensureCard(), ev.gate);
+      setGate(row, "failed", "✗");
+      break;
+    }
+    case "note": {
+      if (state.card) {
+        state.card.appendChild(el(`<div class="verdict-note">${esc(ev.text)}</div>`));
+      }
+      break;
+    }
+    case "candidate_rejected":
+      feedbackCard(state.container, ev.failure || {});
+      break;
+    case "run_finished":
+      break;
+  }
+  scrollDown();
+}
+
+function watch(runId) {
+  const es = new EventSource(`/api/runs/${runId}/events`);
+  es.onmessage = (msg) => {
+    try { handleEvent(JSON.parse(msg.data)); } catch { /* ignore bad line */ }
+  };
+  es.addEventListener("done", async () => {
+    es.close();
+    setRunning(false);
+    try {
+      const record = await (await fetch(`/api/runs/${runId}`)).json();
+      verdictCard(state.container, record);
+    } catch {
+      toast("Could not load the run result", true);
+    }
+    refreshHistory();
+  });
+  es.onerror = () => { /* EventSource retries on its own while the run lives */ };
+}
+
+/* ---------- actions ---------- */
+
+function setRunning(running) {
+  $("#optimize").disabled = running;
+  $("#cancel").classList.toggle("on", running);
+}
+
+function currentOptions() {
+  const options = {};
+  const fuzz = parseInt($("#opt-fuzz").value, 10);
+  if (fuzz > 0) options.fuzz_runs = fuzz;
+  const retries = parseInt($("#opt-retries").value, 10);
+  if (retries > 0) options.max_retries = retries;
+  const model = $("#opt-model").value.trim();
+  if (model) options.model = model;
+  if ($("#opt-hevm").checked) options.hevm = true;
+  return options;
+}
+
+async function startRun() {
+  const source = $("#source").value;
+  if (!source.trim()) { toast("Paste a contract first", true); return; }
+
+  const body = {
+    source,
+    filename: state.filename || null,
+    options: currentOptions(),
+  };
+
+  let response;
+  try {
+    response = await fetch("/api/runs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch {
+    toast("Backend unreachable — is `gas-optimize gui` still running?", true);
+    return;
+  }
+
+  if (response.status === 409) { toast("A run is already in progress", true); return; }
+  if (!response.ok) {
+    const detail = (await response.json().catch(() => ({}))).detail;
+    toast(detail || `Start failed (${response.status})`, true);
+    return;
+  }
+
+  const { run_id } = await response.json();
+  clearThread();
+  selectedRun = run_id;
+  addUserMessage(source, state.filename);
+  state.runId = run_id;
+  state.container = assistantContainer();
+  state.card = null;
+  $("#source").value = "";
+  state.filename = null;
+  autogrow();
+  setRunning(true);
+  watch(run_id);
+  refreshHistory();
+}
+
+async function openRun(runId) {
+  let record;
+  try { record = await (await fetch(`/api/runs/${runId}`)).json(); }
+  catch { toast("Could not load that run", true); return; }
+  if (record.detail) { toast(record.detail, true); return; }
+
+  clearThread();
+  selectedRun = runId;
+  addUserMessage(record.original_source || "(source in runs/" + runId + "/original.sol)", record.filename);
+  state.container = assistantContainer();
+  state.card = null;
+
+  for (const ev of record.events || []) handleEvent(ev);
+  // Recorded streams end with run_finished; if the run is still live, tail it.
+  const last = (record.events || []).at(-1);
+  if (last && last.event !== "run_finished") {
+    state.runId = runId;
+    setRunning(true);
+    watch(runId);
+  } else {
+    verdictCard(state.container, record);
+  }
+  refreshHistory();
+  chat.scrollTop = 0;
+}
+
+/* ---------- composer wiring ---------- */
+
+function autogrow() {
+  const area = $("#source");
+  area.style.height = "auto";
+  area.style.height = Math.min(area.scrollHeight, window.innerHeight * 0.4) + "px";
+}
+
+function loadFile(file) {
+  if (!file) return;
+  file.text().then((text) => {
+    $("#source").value = text;
+    state.filename = file.name;
+    autogrow();
+    toast("Loaded " + file.name);
+  });
+}
+
+$("#optimize").addEventListener("click", startRun);
+$("#source").addEventListener("input", autogrow);
+$("#source").addEventListener("keydown", (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") startRun();
+});
+$("#attach").addEventListener("click", () => $("#filepick").click());
+$("#filepick").addEventListener("change", (e) => loadFile(e.target.files[0]));
+
+const dropbox = $("#dropbox");
+dropbox.addEventListener("dragover", (e) => { e.preventDefault(); dropbox.classList.add("dragging"); });
+dropbox.addEventListener("dragleave", () => dropbox.classList.remove("dragging"));
+dropbox.addEventListener("drop", (e) => {
+  e.preventDefault();
+  dropbox.classList.remove("dragging");
+  loadFile(e.dataTransfer.files[0]);
+});
+
+$("#gear").addEventListener("click", (e) => {
+  e.stopPropagation();
+  const pop = $("#settings");
+  const on = pop.classList.toggle("on");
+  $("#gear").setAttribute("aria-expanded", String(on));
+});
+document.addEventListener("click", (e) => {
+  if (!$("#settings-wrap").contains(e.target)) $("#settings").classList.remove("on");
+});
+
+$("#cancel").addEventListener("click", async () => {
+  if (!state.runId) return;
+  await fetch(`/api/runs/${state.runId}/cancel`, { method: "POST" }).catch(() => {});
+  toast("Cancelling after the current gate…");
+});
+
+$("#new-run").addEventListener("click", () => {
+  clearThread();
+  thread.appendChild(el(`<div id="empty">
+    <h1>Optimize a Solidity contract</h1>
+    <p>Paste the contract below, or drop a .sol file.</p>
+  </div>`));
+  refreshHistory();
+  $("#source").focus();
+});
+
+refreshHealth();
+refreshHistory();
+setInterval(refreshHealth, 30000);
+</script>
+</body>
+</html>
