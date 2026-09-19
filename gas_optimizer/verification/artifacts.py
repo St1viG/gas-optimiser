@@ -39,7 +39,7 @@ class AbiParam:
             return self.type
         inner = ",".join(c.canonical_type for c in self.components)
         # `tuple`, `tuple[]`, `tuple[3]` -> `(...)`, `(...)[]`, `(...)[3]`
-        suffix = self.type[len("tuple"):]
+        suffix = self.type[len("tuple") :]
         return f"({inner}){suffix}"
 
 
@@ -212,7 +212,7 @@ def load(source: Path, contract: str, out_dir: Path | None = None) -> ContractAr
 
     if "storageLayout" not in raw:
         raise ArtifactError(
-            f"{path} has no storageLayout. Add `extra_output = [\"storageLayout\"]` "
+            f'{path} has no storageLayout. Add `extra_output = ["storageLayout"]` '
             f"to foundry.toml and rebuild."
         )
 

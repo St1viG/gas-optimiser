@@ -17,9 +17,7 @@ class TestCanonicalTypes:
         assert param.canonical_type == "(uint256,address)"
 
     def test_tuple_array_keeps_its_suffix(self):
-        param = AbiParam(
-            name="s", type="tuple[]", components=(AbiParam(name="a", type="uint256"),)
-        )
+        param = AbiParam(name="s", type="tuple[]", components=(AbiParam(name="a", type="uint256"),))
         assert param.canonical_type == "(uint256)[]"
 
 

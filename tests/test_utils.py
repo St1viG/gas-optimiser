@@ -18,8 +18,7 @@ class TestCleanLlmResponse:
 
     def test_prefers_the_longest_block(self):
         response = (
-            "Here is a snippet:\n```\nx\n```\n"
-            "And the full file:\n```solidity\ncontract A {}\n```"
+            "Here is a snippet:\n```\nx\n```\nAnd the full file:\n```solidity\ncontract A {}\n```"
         )
         assert utils.clean_llm_response(response) == "contract A {}"
 

@@ -6,8 +6,18 @@ from gas_optimizer.verification import solidity_types as st
 class TestSupport:
     @pytest.mark.parametrize(
         "abi_type",
-        ["uint256", "uint8", "int128", "address", "bool", "bytes32", "bytes", "string",
-         "uint256[]", "address[3]"],
+        [
+            "uint256",
+            "uint8",
+            "int128",
+            "address",
+            "bool",
+            "bytes32",
+            "bytes",
+            "string",
+            "uint256[]",
+            "address[3]",
+        ],
     )
     def test_supported(self, abi_type):
         st.check_supported(abi_type)
