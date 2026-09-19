@@ -51,10 +51,14 @@ class TestRefusalToGenerate:
         with pytest.raises(hg.GenerationError, match="cannot drive"):
             hg.generate(_artifact("A", [weird]), _artifact("B", [weird]))
 
-    def test_no_mutating_functions(self):
-        view_only = _fn("total", outputs=["uint256"], mutability="view")
-        with pytest.raises(hg.GenerationError, match="no public state-changing"):
-            hg.generate(_artifact("A", [view_only]), _artifact("B", [view_only]))
+    def test_no_functions_at_all(self):
+        with pytest.raises(hg.GenerationError, match="no public functions"):
+            hg.generate(_artifact("A", []), _artifact("B", []))
+
+    def test_undrivable_view_parameter(self):
+        weird = _fn("peek", [("data", "(uint256,address)")], ["uint256"], "view")
+        with pytest.raises(hg.GenerationError, match="cannot drive"):
+            hg.generate(_artifact("A", [TRANSFER, weird]), _artifact("B", [TRANSFER, weird]))
 
 
 class TestGeneratedShape:
@@ -108,15 +112,58 @@ class TestGeneratedShape:
         assert "assertLe(b.gas, a.gas" in base
         assert "GASRESULT|" in base
 
+    def test_view_only_contract_is_still_verified(self):
+        view_only = _fn("total", outputs=["uint256"], mutability="view")
+        harness = hg.generate(_artifact("A", [view_only]), _artifact("B", [view_only]))
+        assert harness.covered == ("total()",)
+        assert "function testFuzz_total_raw(" in harness.files[hg.EQUIVALENCE_FILE]
+
+    def test_views_are_fuzzed_and_swept_after_mutations(self):
+        view = _fn("total", outputs=["uint256"], mutability="view")
+        harness = hg.generate(_artifact("A", [TRANSFER, view]), _artifact("B", [TRANSFER, view]))
+        source = harness.files[hg.EQUIVALENCE_FILE]
+        assert harness.covered == ("transfer(address,uint256)", "total()")
+        assert "function testFuzz_total_raw(" in source
+        assert "function testFuzz_total_bounded(" in source
+
+        # mutating tests re-check every zero-arg view over the mutated state...
+        transfer_raw = source.split("testFuzz_transfer_raw")[1].split("function ")[0]
+        assert '_assertViewsMatch("transfer(address,uint256)")' in transfer_raw
+        # ...but view tests do not sweep (nothing was mutated)
+        total_raw = source.split("testFuzz_total_raw")[1].split("function ")[0]
+        assert "_assertViewsMatch" not in total_raw
+
+    def test_views_with_arguments_do_not_join_the_sweep(self):
+        getter = _fn("balanceOf", [("who", "address")], ["uint256"], "view")
+        harness = hg.generate(
+            _artifact("A", [TRANSFER, getter]), _artifact("B", [TRANSFER, getter])
+        )
+        source = harness.files[hg.EQUIVALENCE_FILE]
+        # covered by its own fuzz tests, but there is no zero-arg sweep helper
+        assert "function testFuzz_balanceOf_raw(" in source
+        assert "_assertViewsMatch" not in source
+
+    def test_views_are_gas_benched(self):
+        view = _fn("total", outputs=["uint256"], mutability="view")
+        harness = hg.generate(_artifact("A", [TRANSFER, view]), _artifact("B", [TRANSFER, view]))
+        assert "function test_gas_total()" in harness.files[hg.GAS_BENCH_FILE]
+        assert harness.benched == ("transfer(address,uint256)", "total()")
+
     def test_constructor_arguments_are_supplied(self):
         original = ContractArtifact(
-            name="A", source_name="A.sol", functions=(TRANSFER,),
-            storage=StorageLayout(), deployed_bytecode="0x00",
+            name="A",
+            source_name="A.sol",
+            functions=(TRANSFER,),
+            storage=StorageLayout(),
+            deployed_bytecode="0x00",
             constructor_inputs=(AbiParam(name="owner", type="address"),),
         )
         candidate = ContractArtifact(
-            name="B", source_name="B.sol", functions=(TRANSFER,),
-            storage=StorageLayout(), deployed_bytecode="0x00",
+            name="B",
+            source_name="B.sol",
+            functions=(TRANSFER,),
+            storage=StorageLayout(),
+            deployed_bytecode="0x00",
             constructor_inputs=(AbiParam(name="owner", type="address"),),
         )
         source = hg.generate(original, candidate).files[hg.EQUIVALENCE_FILE]
@@ -127,9 +174,7 @@ class TestGeneratedShape:
 @pytest.mark.foundry
 class TestAgainstRealArtifacts:
     def test_erc20_harness_seeds_the_balance_mapping(self, fixtures, build_pair):
-        original, candidate = build_pair(
-            fixtures / "ERC20.sol", fixtures / "ERC20Candidate.sol"
-        )
+        original, candidate = build_pair(fixtures / "ERC20.sol", fixtures / "ERC20Candidate.sol")
         harness = hg.generate(original, candidate)
         source = harness.files[hg.EQUIVALENCE_FILE]
         # balanceOf sits in slot 1 per the compiler's own layout

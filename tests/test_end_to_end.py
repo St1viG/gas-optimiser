@@ -26,9 +26,15 @@ class TestValidatorControls:
         )
         assert result.ok, result.failure
         assert result.total_delta < 0
-        (entry,) = result.gas
-        assert entry.signature == "transfer(address,uint256)"
-        assert entry.improved
+        by_signature = {entry.signature: entry for entry in result.gas}
+        # views are measured too now — the getters ride along at equal cost
+        assert set(by_signature) == {
+            "transfer(address,uint256)",
+            "totalSupply()",
+            "balanceOf(address)",
+        }
+        assert by_signature["transfer(address,uint256)"].improved
+        assert not any(entry.regressed for entry in result.gas)
 
     def test_unchecked_underflow_is_rejected(self, fixtures):
         """The candidate wraps where the original reverts."""
@@ -79,6 +85,33 @@ class TestValidatorControls:
         )
         assert result.ok, result.failure
         assert result.total_delta < 0
+
+    def test_lying_view_is_rejected(self, fixtures):
+        """Storage and mutations match; only the getter misreports.
+
+        Views were previously never verified, so this class of divergence was
+        invisible: a candidate could change what balanceOf() returns and pass.
+        """
+        result = validator.validate(
+            fixtures / "Counter.sol", fixtures / "CounterBadView.sol", FAST, verbose=False
+        )
+        assert not result.ok
+        assert result.failure["type"] == "equivalence_error"
+        assert "mismatch" in result.failure["error"]
+
+    def test_view_only_saving_is_accepted(self, fixtures):
+        """The only improvement is one fewer SLOAD in a view.
+
+        Views were previously not gas-benched, so a saving confined to a view
+        could never satisfy the strictly-cheaper gate.
+        """
+        result = validator.validate(
+            fixtures / "Registry.sol", fixtures / "RegistryViewOpt.sol", FAST, verbose=False
+        )
+        assert result.ok, result.failure
+        assert result.total_delta < 0
+        improved = [entry.signature for entry in result.gas if entry.improved]
+        assert improved == ["share(address)"]
 
     def test_gas_gate_can_be_disabled(self, fixtures, tmp_path):
         renamed = tmp_path / "ERC20NoOp.sol"

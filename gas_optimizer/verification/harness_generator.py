@@ -3,10 +3,13 @@ Generates the Solidity harness that decides whether a candidate is accepted.
 
 Two files are emitted into the Foundry test dir:
 
-  EquivalenceTest.t.sol  differential fuzzing: for every mutating function, call
-                         original and candidate with identical calldata from
-                         identical state and require identical revert status,
-                         return data, storage writes and events.
+  EquivalenceTest.t.sol  differential fuzzing: for every public function (views
+                         included), call original and candidate with identical
+                         calldata from identical state and require identical
+                         revert status, return data, storage writes and events.
+                         After each mutating call, every zero-argument view is
+                         additionally compared, so a getter that lies about
+                         mutated state is caught.
   GasBench.t.sol         deterministic per-function gas measurement, asserting
                          the candidate never regresses.
 
@@ -45,10 +48,37 @@ BASE_FILE = "HarnessBase.sol"
 SEED_AMOUNT = "1_000_000 ether"
 
 _RESERVED = {
-    "original", "candidate", "vm", "SEED", "BENCH_ACTOR", "payload", "value",
-    "assembly", "return", "returns", "memory", "storage", "calldata", "function",
-    "contract", "address", "bool", "bytes", "string", "int", "uint", "this",
-    "msg", "block", "tx", "now", "gasleft", "type", "new", "delete", "emit",
+    "original",
+    "candidate",
+    "vm",
+    "SEED",
+    "BENCH_ACTOR",
+    "payload",
+    "value",
+    "assembly",
+    "return",
+    "returns",
+    "memory",
+    "storage",
+    "calldata",
+    "function",
+    "contract",
+    "address",
+    "bool",
+    "bytes",
+    "string",
+    "int",
+    "uint",
+    "this",
+    "msg",
+    "block",
+    "tx",
+    "now",
+    "gasleft",
+    "type",
+    "new",
+    "delete",
+    "emit",
 }
 
 
@@ -155,9 +185,7 @@ def _seed_lines(
                 for b in inner:
                     ka, kb = _key_expr(chain[0], a), _key_expr(chain[1], b)
                     if ka and kb:
-                        lines.append(
-                            f"{indent}_seedBoth(_slot2({ka}, {kb}, {entry.slot}), SEED);"
-                        )
+                        lines.append(f"{indent}_seedBoth(_slot2({ka}, {kb}, {entry.slot}), SEED);")
 
     return lines
 
@@ -221,6 +249,7 @@ def _equivalence_test(
     storage: StorageLayout,
     max_array_length: int,
     bounded: bool,
+    sweep_views: bool = False,
 ) -> str:
     names = _param_names(func)
     for p in func.inputs:
@@ -242,9 +271,10 @@ def _equivalence_test(
     address_exprs = ["address(this)"] + [
         n for n, p in zip(names, func.inputs, strict=True) if st.is_address(p.type)
     ]
-    uint_exprs = [
-        n for n, p in zip(names, func.inputs, strict=True) if st.is_unsigned(p.type)
-    ] + ["0", "1"]
+    uint_exprs = [n for n, p in zip(names, func.inputs, strict=True) if st.is_unsigned(p.type)] + [
+        "0",
+        "1",
+    ]
     body += _seed_lines(storage, address_exprs, uint_exprs)
 
     value = "callValue" if func.is_payable else "0"
@@ -256,6 +286,10 @@ def _equivalence_test(
     body.append(f"        CallResult memory b = _exec(candidate, payload, {value});")
     body.append("")
     body.append(f'        _assertEquivalent(a, b, "{ctx}");')
+    if sweep_views:
+        # Views read over *mutated* state — this is what catches a getter that
+        # only lies after a state change the seeder never produces.
+        body.append(f'        _assertViewsMatch("{ctx}");')
 
     kind = "bounded" if bounded else "raw"
     return (
@@ -265,20 +299,46 @@ def _equivalence_test(
     )
 
 
+def _views_match_helper(views: list[AbiFunction]) -> str:
+    """The post-mutation sweep: every zero-argument view must agree."""
+    if not views:
+        return ""
+    lines = [
+        "    /// @dev Called after every mutating differential call, so getters are",
+        "    ///      checked over mutated state, not just the seeded baseline.",
+        "    function _assertViewsMatch(string memory ctx) internal {",
+    ]
+    for func in views:
+        lines.append(
+            f'        _assertViewEq(abi.encodeWithSignature("{func.signature}"), '
+            f'string.concat(ctx, " -> {func.signature}"));'
+        )
+    lines.append("    }\n")
+    return "\n" + "\n".join(lines)
+
+
 def _equivalence_source(
     original: ContractArtifact,
     candidate: ContractArtifact,
     max_array_length: int,
 ) -> tuple[str, list[str]]:
-    suffixes = _test_suffixes(original.mutating_functions)
+    suffixes = _test_suffixes(original.functions)
+    zero_arg_views = [f for f in original.view_functions if not f.inputs]
 
     tests: list[str] = []
     covered: list[str] = []
-    for func in original.mutating_functions:
+    for func in original.functions:
         suffix = suffixes[func.signature]
         for bounded in (False, True):
             tests.append(
-                _equivalence_test(func, suffix, original.storage, max_array_length, bounded)
+                _equivalence_test(
+                    func,
+                    suffix,
+                    original.storage,
+                    max_array_length,
+                    bounded,
+                    sweep_views=func.is_mutating and bool(zero_arg_views),
+                )
             )
         covered.append(func.signature)
 
@@ -298,7 +358,7 @@ contract EquivalenceTest is HarnessBase {{
     }}
 
 """
-    return header + "\n".join(tests) + "}\n", covered
+    return header + "\n".join(tests) + _views_match_helper(zero_arg_views) + "}\n", covered
 
 
 # --- gas benchmark -----------------------------------------------------------
@@ -336,11 +396,11 @@ def _gas_test(func: AbiFunction, suffix: str, storage: StorageLayout) -> str:
 
 
 def _gas_source(original: ContractArtifact, candidate: ContractArtifact) -> tuple[str, list[str]]:
-    suffixes = _test_suffixes(original.mutating_functions)
+    suffixes = _test_suffixes(original.functions)
 
     tests: list[str] = []
     benched: list[str] = []
-    for func in original.mutating_functions:
+    for func in original.functions:
         tests.append(_gas_test(func, suffixes[func.signature], original.storage))
         benched.append(func.signature)
 
@@ -430,6 +490,15 @@ abstract contract HarnessBase is Test {{
         }}
     }}
 
+    /// @dev Views are compared through a plain call so a reverting getter is a
+    ///      status mismatch on both sides, never a harness failure.
+    function _assertViewEq(bytes memory payload, string memory ctx) internal {{
+        (bool okA, bytes memory retA) = original.call(payload);
+        (bool okB, bytes memory retB) = candidate.call(payload);
+        assertEq(okA, okB, string.concat(ctx, ": view revert-status mismatch"));
+        assertEq(retA, retB, string.concat(ctx, ": view returndata mismatch"));
+    }}
+
     function _assertLogsEq(CallResult memory a, CallResult memory b, string memory ctx)
         internal
         pure
@@ -511,10 +580,10 @@ def generate(
     function or an undrivable parameter type is a hard failure, never a comment
     in the generated file.
     """
-    if not original.mutating_functions:
+    if not original.functions:
         raise GenerationError(
-            f"{original.name} exposes no public state-changing functions; there is "
-            f"nothing to verify or to optimize."
+            f"{original.name} exposes no public functions; there is nothing to "
+            f"verify or to optimize."
         )
 
     missing = sorted(f.signature for f in original.functions if not candidate.find(f.signature))
@@ -528,7 +597,7 @@ def generate(
             "candidate exposes functions the original does not: " + ", ".join(added)
         )
 
-    for func in original.mutating_functions:
+    for func in original.functions:
         for p in func.inputs:
             try:
                 st.check_supported(p.canonical_type)
