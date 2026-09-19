@@ -696,9 +696,9 @@ def validate(
     return ValidationResult(True, None, gas=gas, notes=notes)
 
 
-# --- standalone CLI ----------------------------------------------------------
+# --- standalone CLI (deprecated shim) -----------------------------------------
 
-_USAGE = """Usage:
+_USAGE = """Usage (deprecated — use `gas-optimize validate` instead):
   python -m gas_optimizer.validator <original.sol> <candidate.sol>
   python -m gas_optimizer.validator --config
   python -m gas_optimizer.validator --hevm-enable | --hevm-disable
@@ -706,41 +706,27 @@ _USAGE = """Usage:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Deprecated: forwards to `gas-optimize validate` / `gas-optimize config`."""
+    from . import cli
+
     argv = sys.argv[1:] if argv is None else argv
+    print(
+        "[DEPRECATED] `python -m gas_optimizer.validator` is now `gas-optimize validate`.",
+        file=sys.stderr,
+    )
 
-    if not argv:
+    if not argv or (not argv[0].startswith("--") and len(argv) < 2):
         print(_USAGE)
-        return 1
-
-    if argv[0] in ("--hevm-enable", "--hevm-disable"):
-        settings = load_config()
-        settings["hevm_enabled"] = argv[0] == "--hevm-enable"
-        save_config(settings)
-        print(f"hevm {'enabled' if settings['hevm_enabled'] else 'disabled'}")
-        return 0
+        return 2
 
     if argv[0] == "--config":
-        for key, value in load_config().items():
-            print(f"  {key}: {_render(value)}")
-        return 0
+        return cli.main(["config", "show"])
 
-    if len(argv) < 2:
-        print(_USAGE)
-        return 1
+    if argv[0] in ("--hevm-enable", "--hevm-disable"):
+        value = "true" if argv[0] == "--hevm-enable" else "false"
+        return cli.main(["config", "set", "hevm.enabled", value])
 
-    result = validate(argv[0], argv[1])
-
-    if result.ok:
-        print("\nACCEPTED: equivalent and cheaper")
-        print(result.gas_summary())
-        return 0
-
-    print(f"\nREJECTED [{result.failure['type']}]: {result.failure['error']}")
-    if result.failure.get("trace"):
-        print(result.failure["trace"])
-    if result.gas:
-        print(result.gas_summary())
-    return 1
+    return cli.main(["validate", *argv])
 
 
 if __name__ == "__main__":
