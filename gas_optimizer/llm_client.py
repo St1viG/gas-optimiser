@@ -13,8 +13,10 @@ Hardened in three ways the previous version was not:
 from __future__ import annotations
 
 import inspect
+import sys
 import time
 from functools import lru_cache
+from typing import Any
 
 from huggingface_hub import InferenceClient
 
@@ -25,9 +27,17 @@ MAX_TOKENS = 4096
 TEMPERATURE = 0.1
 
 _TRANSIENT_HINTS = (
-    "429", "500", "502", "503", "504",
-    "timeout", "timed out", "overloaded", "rate limit",
-    "currently loading", "temporarily unavailable",
+    "429",
+    "500",
+    "502",
+    "503",
+    "504",
+    "timeout",
+    "timed out",
+    "overloaded",
+    "rate limit",
+    "currently loading",
+    "temporarily unavailable",
 )
 
 
@@ -37,7 +47,7 @@ class LLMError(RuntimeError):
 
 @lru_cache(maxsize=1)
 def _client() -> InferenceClient:
-    kwargs: dict[str, object] = {"api_key": config.get_hf_token()}
+    kwargs: dict[str, Any] = {"api_key": config.get_hf_token()}
 
     provider = config.HF_PROVIDER
     if provider and "provider" in inspect.signature(InferenceClient.__init__).parameters:
@@ -51,13 +61,14 @@ def _is_transient(exc: Exception) -> bool:
     return any(hint in text for hint in _TRANSIENT_HINTS)
 
 
-def _complete(system: str, user: str) -> str:
+def _complete(system: str, user: str, model: str | None = None) -> str:
+    model_id = model or config.MODEL_ID
     last: Exception | None = None
 
     for attempt in range(1, config.API_RETRIES + 1):
         try:
             response = _client().chat.completions.create(
-                model=config.MODEL_ID,
+                model=model_id,
                 messages=[
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
@@ -70,7 +81,11 @@ def _complete(system: str, user: str) -> str:
             if attempt == config.API_RETRIES or not _is_transient(exc):
                 break
             delay = 2 ** (attempt - 1)
-            print(f"    [API] {type(exc).__name__}: {exc} — retrying in {delay}s")
+            # stderr: stdout may be carrying a machine-readable event stream.
+            print(
+                f"    [API] {type(exc).__name__}: {exc} — retrying in {delay}s",
+                file=sys.stderr,
+            )
             time.sleep(delay)
             continue
 
@@ -79,10 +94,12 @@ def _complete(system: str, user: str) -> str:
             return content
         last = LLMError("the model returned an empty message")
 
-    raise LLMError(f"{config.MODEL_ID} could not be reached: {last}") from last
+    raise LLMError(f"{model_id} could not be reached: {last}") from last
 
 
-def get_optimization_proposal(current_code: str, retry_info: dict | None = None) -> str:
+def get_optimization_proposal(
+    current_code: str, retry_info: dict | None = None, *, model: str | None = None
+) -> str:
     """Ask for an optimized version of `current_code`.
 
     Returns the cleaned contract source. Raises LLMError if the API could not
@@ -100,7 +117,7 @@ def get_optimization_proposal(current_code: str, retry_info: dict | None = None)
             code=current_code,
         )
 
-    candidate = utils.clean_llm_response(_complete(prompts.SYSTEM_PROMPT, user))
+    candidate = utils.clean_llm_response(_complete(prompts.SYSTEM_PROMPT, user, model=model))
     if not candidate:
         raise LLMError("the model returned an empty contract")
     return candidate

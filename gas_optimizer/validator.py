@@ -30,24 +30,14 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import config
+from . import config, events, render
+from . import settings as settings_module
 from .verification import artifacts, harness_generator
 
-DEFAULT_SETTINGS: dict[str, object] = {
-    "fuzz_runs": 2000,
-    "hevm_enabled": False,
-    "hevm_timeout": 300,
-    "hevm_smt_timeout": 30,
-    "hevm_solver": "z3",
-    "hevm_max_iterations": 5,
-    "max_array_length": 5,
-    "require_gas_improvement": True,
-    "forge_timeout": 900,
-}
+DEFAULT_SETTINGS: dict[str, object] = settings_module.default_validator_settings()
 
-BOOL_KEYS = {"hevm_enabled", "require_gas_improvement"}
-STR_KEYS = {"hevm_solver"}
-_TRUTHY = ("true", "1", "yes", "on")
+BOOL_KEYS = settings_module.LEGACY_BOOL_KEYS
+STR_KEYS = settings_module.LEGACY_STR_KEYS
 
 GAS_LOG_PREFIX = "GASRESULT|"
 
@@ -55,33 +45,16 @@ GAS_LOG_PREFIX = "GASRESULT|"
 # --- configuration -----------------------------------------------------------
 
 
-def load_config(config_path: Path | str = config.VALIDATOR_CONFIG_PATH) -> dict:
-    """Load validator settings, falling back to DEFAULT_SETTINGS."""
-    settings = dict(DEFAULT_SETTINGS)
+def load_config(config_path: Path | str | None = None) -> dict:
+    """Validator settings as a flat dict.
 
-    path = Path(config_path)
-    if not path.exists():
-        return settings
-
-    for line in path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-
-        key, value = (part.strip() for part in line.split("=", 1))
-        if key not in settings:
-            continue
-        if key in BOOL_KEYS:
-            settings[key] = value.lower() in _TRUTHY
-        elif key in STR_KEYS:
-            settings[key] = value
-        else:
-            try:
-                settings[key] = int(value)
-            except ValueError:
-                settings[key] = value
-
-    return settings
+    With an explicit path, parse that legacy validatorConfig.txt file (the
+    historical behavior). Without one, resolve the layered configuration —
+    env > gas-optimizer.toml > legacy file > defaults (see settings.py).
+    """
+    if config_path is not None:
+        return settings_module.parse_legacy(config_path)
+    return settings_module.resolve().validator
 
 
 def _render(value: object) -> str:
@@ -143,10 +116,7 @@ class GasEntry:
         if not self.comparable:
             return f"{self.signature}: reverted, not measured"
         sign = "+" if self.delta > 0 else ""
-        return (
-            f"{self.signature}: {self.original} -> {self.candidate} gas "
-            f"({sign}{self.delta})"
-        )
+        return f"{self.signature}: {self.original} -> {self.candidate} gas ({sign}{self.delta})"
 
 
 @dataclass
@@ -361,9 +331,7 @@ def _run_equivalence(settings: dict) -> tuple[bool, dict | None]:
 
 def _run_gas_bench(settings: dict) -> tuple[list[GasEntry], dict | None]:
     timeout = settings["forge_timeout"]
-    suites, raw = _forge_test_json(
-        ["test", "--match-contract", "GasBench", "--isolate"], timeout
-    )
+    suites, raw = _forge_test_json(["test", "--match-contract", "GasBench", "--isolate"], timeout)
 
     if not suites:
         return [], _failure(
@@ -476,13 +444,18 @@ def _run_hevm(
     treat that as "skipped", not as evidence against the candidate.
     """
     cmd = [
-        "hevm", "equivalence",
-        "--code-a-file", str(original_bin),
-        "--code-b-file", str(candidate_bin),
+        "hevm",
+        "equivalence",
+        "--code-a-file",
+        str(original_bin),
+        "--code-b-file",
+        str(candidate_bin),
         # Spelled --smt-timeout, in SECONDS. The old --smttimeout with a
         # millisecond value was rejected outright, so hevm never ran.
-        "--smt-timeout", str(settings["hevm_smt_timeout"]),
-        "--max-iterations", str(settings["hevm_max_iterations"]),
+        "--smt-timeout",
+        str(settings["hevm_smt_timeout"]),
+        "--max-iterations",
+        str(settings["hevm_max_iterations"]),
     ]
     solver = str(settings.get("hevm_solver", "")).strip()
     if solver:
@@ -504,8 +477,10 @@ def _run_hevm(
             return True, [], ""
         if verdict is False:
             return False, counterexamples, ""
-        return False, [], (
-            f"hevm gave no verdict (exit {process.returncode}): {stdout.strip()[:200]}"
+        return (
+            False,
+            [],
+            (f"hevm gave no verdict (exit {process.returncode}): {stdout.strip()[:200]}"),
         )
 
     except subprocess.TimeoutExpired:
@@ -576,6 +551,8 @@ def validate(
     candidate_path: Path | str,
     settings: dict | None = None,
     verbose: bool = True,
+    *,
+    on_event: events.EventSink | None = None,
 ) -> ValidationResult:
     """Run every gate against a contract pair."""
     settings = settings or load_config()
@@ -583,25 +560,41 @@ def validate(
     original_path = Path(original_path).resolve()
     candidate_path = Path(candidate_path).resolve()
 
-    def say(message: str) -> None:
-        if verbose:
-            print(message)
+    emit = (
+        on_event
+        if on_event is not None
+        else (render.ConsoleRenderer() if verbose else events.NULL_SINK)
+    )
+
+    def rejected(
+        gate: str, failure: dict, gas: list[GasEntry] | None = None, notes: list[str] | None = None
+    ) -> ValidationResult:
+        emit(events.GateFailed(gate=gate, failure=failure))
+        return ValidationResult(False, failure, gas=gas or [], notes=notes or [])
 
     original_name = _contract_name(original_path)
     candidate_name = _contract_name(candidate_path)
     if not original_name:
-        return ValidationResult(
-            False,
-            _failure("parse_error", f"no contract declared in {original_path}", compile_ok=False),
+        return rejected(
+            "parse",
+            _failure(
+                "parse_error",
+                f"no contract declared in {original_path}",
+                compile_ok=False,
+            ),
         )
     if not candidate_name:
-        return ValidationResult(
-            False,
-            _failure("parse_error", f"no contract declared in {candidate_path}", compile_ok=False),
+        return rejected(
+            "parse",
+            _failure(
+                "parse_error",
+                f"no contract declared in {candidate_path}",
+                compile_ok=False,
+            ),
         )
     if original_name == candidate_name:
-        return ValidationResult(
-            False,
+        return rejected(
+            "parse",
             _failure(
                 "shape_error",
                 f"original and candidate both declare `{original_name}`; the candidate must be "
@@ -610,18 +603,42 @@ def validate(
             ),
         )
 
-    say(
-        f"[VALIDATE] {original_name} ({original_path.name}) vs "
-        f"{candidate_name} ({candidate_path.name})"
+    emit(
+        events.GateStarted(
+            gate="validate",
+            detail=f"{original_name} ({original_path.name}) vs "
+            f"{candidate_name} ({candidate_path.name})",
+        )
     )
 
     src_original, src_candidate = prepare_workspace(original_path, candidate_path)
 
-    say("[VALIDATE] Building...")
+    emit(events.GateStarted(gate="build"))
     returncode, stdout, stderr = run_forge(["build"], timeout=settings["forge_timeout"])
+    if returncode == 127:
+        # The model cannot fix a missing toolchain; report it as what it is.
+        return rejected(
+            "build",
+            _failure(
+                "environment_error",
+                "forge is not installed or not on PATH — install Foundry: https://getfoundry.sh",
+                compile_ok=False,
+                trace=stderr[-1500:],
+            ),
+        )
+    if returncode == 124:
+        return rejected(
+            "build",
+            _failure(
+                "environment_error",
+                f"forge build timed out after {settings['forge_timeout']}s",
+                compile_ok=False,
+                trace=stderr[-1500:],
+            ),
+        )
     if returncode != 0:
-        return ValidationResult(
-            False,
+        return rejected(
+            "build",
             _failure(
                 "compile_error",
                 "the candidate does not compile",
@@ -629,47 +646,52 @@ def validate(
                 trace=(stdout + stderr)[-1500:],
             ),
         )
+    emit(events.GatePassed(gate="build"))
 
     try:
         original_artifact = artifacts.load(src_original, original_name)
         candidate_artifact = artifacts.load(src_candidate, candidate_name)
     except artifacts.ArtifactError as exc:
-        return ValidationResult(False, _failure("harness_error", str(exc)))
+        return rejected("artifacts", _failure("harness_error", str(exc)))
 
-    say("[VALIDATE] Generating equivalence + gas harness...")
+    emit(events.GateStarted(gate="harness"))
     try:
         harness = harness_generator.generate(
             original_artifact, candidate_artifact, settings["max_array_length"]
         )
     except harness_generator.GenerationError as exc:
-        return ValidationResult(False, _failure("harness_error", str(exc)))
+        return rejected("harness", _failure("harness_error", str(exc)))
 
     for name, source in harness.files.items():
         (config.TEST_FOLDER / name).write_text(source, encoding="utf-8")
-    say(f"[VALIDATE] Covering {len(harness.covered)} function(s): {', '.join(harness.covered)}")
+    emit(
+        events.GatePassed(
+            gate="harness",
+            detail=f"Covering {len(harness.covered)} function(s): {', '.join(harness.covered)}",
+        )
+    )
 
-    say(f"[VALIDATE] Differential fuzzing ({settings['fuzz_runs']} runs)...")
+    emit(events.GateStarted(gate="equivalence", detail=f"{settings['fuzz_runs']} runs"))
     equivalent, failure = _run_equivalence(settings)
     if not equivalent:
-        return ValidationResult(False, failure)
-    say("[VALIDATE] Equivalence holds.")
+        return rejected("equivalence", failure or {})
+    emit(events.GatePassed(gate="equivalence"))
 
-    say("[VALIDATE] Measuring gas...")
+    emit(events.GateStarted(gate="gas"))
     gas, failure = _run_gas_bench(settings)
     if failure:
-        return ValidationResult(False, failure, gas=gas)
-    say("[VALIDATE] Gas gate passed:")
-    if verbose:
-        print(ValidationResult(True, gas=gas).gas_summary())
+        return rejected("gas", failure, gas=gas)
+    emit(events.GatePassed(gate="gas", detail=ValidationResult(True, gas=gas).gas_summary()))
 
     notes: list[str] = []
     if settings.get("hevm_enabled", False):
-        say("[VALIDATE] Running hevm symbolic check...")
+        emit(events.GateStarted(gate="hevm"))
         failure, notes = _hevm_gate(original_artifact, candidate_artifact, settings)
         for note in notes:
-            say(f"[VALIDATE] {note}")
+            emit(events.Note(text=note))
         if failure:
-            return ValidationResult(False, failure, gas=gas, notes=notes)
+            return rejected("hevm", failure, gas=gas, notes=notes)
+        emit(events.GatePassed(gate="hevm"))
 
     return ValidationResult(True, None, gas=gas, notes=notes)
 
